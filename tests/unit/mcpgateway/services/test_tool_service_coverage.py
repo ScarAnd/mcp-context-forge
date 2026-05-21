@@ -8863,7 +8863,7 @@ class TestInvokeToolMcpSse:
             patch("mcpgateway.services.tool_service.sse_client", side_effect=fake_sse_client),
             patch("mcpgateway.services.tool_service.ClientSession", return_value=_SessionCM()),
             patch("mcpgateway.services.tool_service.httpx.AsyncClient", return_value=MagicMock()),
-            patch("mcpgateway.services.tool_service.get_cached_ssl_context") as mock_get_ssl,
+            patch("mcpgateway.utils.ssl_context_cache.get_cached_ssl_context") as mock_get_ssl,
         ):
             mock_gcc.get_passthrough_headers = MagicMock(return_value=[])
             mock_trace.get = MagicMock(return_value=None)
@@ -8924,7 +8924,7 @@ class TestInvokeToolMcpSse:
             patch("mcpgateway.services.tool_service.sse_client", side_effect=fake_sse_client),
             patch("mcpgateway.services.tool_service.ClientSession", return_value=_SessionCM()),
             patch("mcpgateway.services.tool_service.httpx.AsyncClient", return_value=MagicMock()),
-            patch("mcpgateway.services.tool_service.get_cached_ssl_context") as mock_get_ssl,
+            patch("mcpgateway.utils.ssl_context_cache.get_cached_ssl_context") as mock_get_ssl,
             patch.object(settings, "enable_ed25519_signing", False),
         ):
             mock_gcc.get_passthrough_headers = MagicMock(return_value=[])
@@ -8998,7 +8998,7 @@ class TestInvokeToolMcpSse:
             patch("mcpgateway.services.tool_service.sse_client", side_effect=fake_sse_client),
             patch("mcpgateway.services.tool_service.ClientSession", return_value=_SessionCM()),
             patch("mcpgateway.services.tool_service.httpx.AsyncClient", return_value=MagicMock()),
-            patch("mcpgateway.services.tool_service.get_cached_ssl_context") as mock_get_ssl,
+            patch("mcpgateway.utils.ssl_context_cache.get_cached_ssl_context") as mock_get_ssl,
             patch.object(settings, "enable_ed25519_signing", False),
         ):
             mock_gcc.get_passthrough_headers = MagicMock(return_value=[])
@@ -9063,7 +9063,7 @@ class TestInvokeToolMcpSse:
             patch("mcpgateway.services.tool_service.sse_client", side_effect=fake_sse_client),
             patch("mcpgateway.services.tool_service.ClientSession", return_value=_SessionCM()),
             patch("mcpgateway.services.tool_service.httpx.AsyncClient", return_value=MagicMock()),
-            patch("mcpgateway.services.tool_service.get_cached_ssl_context") as mock_get_ssl,
+            patch("mcpgateway.utils.ssl_context_cache.get_cached_ssl_context") as mock_get_ssl,
             patch("mcpgateway.services.encryption_service.get_encryption_service", side_effect=RuntimeError("no encryption")),
             patch.object(settings, "enable_ed25519_signing", False),
         ):
@@ -9130,7 +9130,7 @@ class TestInvokeToolMcpSse:
             patch("mcpgateway.services.tool_service.sse_client", side_effect=fake_sse_client),
             patch("mcpgateway.services.tool_service.ClientSession", return_value=_SessionCM()),
             patch("mcpgateway.services.tool_service.httpx.AsyncClient", return_value=MagicMock()),
-            patch("mcpgateway.services.tool_service.validate_signature", return_value=False) as mock_vs,
+            patch("mcpgateway.utils.validate_signature.validate_signature", return_value=False) as mock_vs,
             patch.object(settings, "enable_ed25519_signing", True),
             patch.object(settings, "ed25519_public_key", "pubkey"),
         ):
@@ -9197,7 +9197,7 @@ class TestInvokeToolMcpSse:
             patch("mcpgateway.services.tool_service.compute_passthrough_headers_cached", side_effect=lambda _rh, h, *_a, **_k: h),
             patch("mcpgateway.services.tool_service.sse_client", side_effect=fake_sse_client),
             patch("mcpgateway.services.tool_service.ClientSession", return_value=_SessionCM()),
-            patch("mcpgateway.services.tool_service.get_cached_ssl_context", return_value=MagicMock()),
+            patch("mcpgateway.utils.ssl_context_cache.get_cached_ssl_context", return_value=MagicMock()),
             patch("mcpgateway.services.tool_service.httpx.AsyncClient", return_value=MagicMock()),
             patch.object(settings, "enable_ed25519_signing", False),
         ):
@@ -9271,7 +9271,7 @@ class TestInvokeToolMcpSse:
                 patch("mcpgateway.services.tool_service.get_correlation_id", return_value="corr-1"),
                 patch("mcpgateway.services.tool_service.compute_passthrough_headers_cached", side_effect=lambda _rh, h, *_a, **_k: h),
                 patch("mcpgateway.services.tool_service.get_upstream_session_registry", return_value=registry),
-                patch("mcpgateway.services.tool_service.get_cached_ssl_context") as mock_cached_ssl_context,
+                patch("mcpgateway.utils.ssl_context_cache.get_cached_ssl_context") as mock_cached_ssl_context,
                 patch("mcpgateway.services.tool_service.httpx.AsyncClient", return_value=MagicMock()),
                 patch.object(settings, "enable_ed25519_signing", False),
             ):
