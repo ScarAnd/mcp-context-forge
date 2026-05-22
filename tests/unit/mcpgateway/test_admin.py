@@ -3184,7 +3184,8 @@ class TestAdminGatewayRoutes:
 
             result = await admin_add_gateway(mock_request, mock_db, user={"email": "test-user", "db": mock_db})
             assert isinstance(result, JSONResponse)
-            assert result.status_code == 200
+            # ASYNC LIFECYCLE: register_gateway returns 202 Accepted (status=pending)
+            assert result.status_code == 202
 
     @patch.object(GatewayService, "register_gateway")
     async def test_admin_add_gateway_without_auth(self, mock_register_gateway, mock_request, mock_db):
@@ -3201,7 +3202,8 @@ class TestAdminGatewayRoutes:
 
         result = await admin_add_gateway(mock_request, mock_db, user={"email": "test-user", "db": mock_db})
         assert isinstance(result, JSONResponse)
-        assert result.status_code == 200
+        # ASYNC LIFECYCLE: register_gateway returns 202 Accepted (status=pending)
+        assert result.status_code == 202
 
     @patch.object(GatewayService, "register_gateway")
     async def test_admin_add_gateway_connection_error(self, mock_register_gateway, mock_request, mock_db):
@@ -3279,7 +3281,7 @@ class TestAdminGatewayRoutes:
 
         result = await admin_edit_gateway(gateway_id, mock_request, mock_db, user={"email": "test-user", "db": mock_db})
 
-        assert result.status_code == 200
+        assert result.status_code == 202
         team_service.verify_team_for_user.assert_called_once_with("test-user", existing_team_id)
         call_args = mock_update_gateway.call_args
         gateway_update = call_args[1].get("gateway") or call_args[0][2]
@@ -6355,7 +6357,7 @@ class TestOAuthFunctionality:
         mock_update_gateway.return_value = None
         response = await admin_edit_gateway("gateway-1", mock_request, mock_db, user={"email": "test-user", "db": mock_db})
         assert isinstance(response, JSONResponse)
-        assert response.status_code == 200
+        assert response.status_code == 202
 
     @patch.object(GatewayService, "register_gateway")
     async def test_admin_add_gateway_oauth_assembled_from_form_fields(self, mock_register_gateway, mock_request, mock_db):
@@ -6400,7 +6402,8 @@ class TestOAuthFunctionality:
 
             result = await admin_add_gateway(mock_request, mock_db, user={"email": "test-user", "db": mock_db})
             assert isinstance(result, JSONResponse)
-            assert result.status_code == 200
+            # ASYNC LIFECYCLE: register_gateway returns 202 Accepted (status=pending)
+            assert result.status_code == 202
 
             gateway_create = mock_register_gateway.call_args.args[1]
             assert gateway_create.oauth_config["grant_type"] == "client_credentials"
@@ -6448,7 +6451,8 @@ class TestOAuthFunctionality:
 
             result = await admin_add_gateway(mock_request, mock_db, user={"email": "test-user", "db": mock_db})
             assert isinstance(result, JSONResponse)
-            assert result.status_code == 200
+            # ASYNC LIFECYCLE: register_gateway returns 202 Accepted (status=pending)
+            assert result.status_code == 202
 
             gateway_create = mock_register_gateway.call_args.args[1]
             assert gateway_create.auth_type == "oauth"
@@ -6486,7 +6490,8 @@ class TestOAuthFunctionality:
 
             result = await admin_add_gateway(mock_request, mock_db, user={"email": "test-user", "db": mock_db})
             assert isinstance(result, JSONResponse)
-            assert result.status_code == 200
+            # ASYNC LIFECYCLE: register_gateway returns 202 Accepted (status=pending)
+            assert result.status_code == 202
 
             gateway_create = mock_register_gateway.call_args.args[1]
             assert gateway_create.auth_type == "oauth"
@@ -6516,7 +6521,8 @@ class TestOAuthFunctionality:
 
             result = await admin_add_gateway(mock_request, mock_db, user={"email": "test-user", "db": mock_db})
             assert isinstance(result, JSONResponse)
-            assert result.status_code == 200
+            # ASYNC LIFECYCLE: register_gateway returns 202 Accepted (status=pending)
+            assert result.status_code == 202
 
             gateway_create = mock_register_gateway.call_args.args[1]
             assert gateway_create.auth_type == "oauth"
@@ -6557,7 +6563,8 @@ class TestOAuthFunctionality:
 
             result = await admin_edit_gateway("gateway-1", mock_request, mock_db, user={"email": "test-user", "db": mock_db})
             assert isinstance(result, JSONResponse)
-            assert result.status_code == 200
+            # ASYNC LIFECYCLE: register_gateway returns 202 Accepted (status=pending)
+            assert result.status_code == 202
 
             gateway_update = mock_update_gateway.call_args.args[2]
             assert gateway_update.oauth_config["issuer"] == "https://issuer.example.com"
@@ -6592,7 +6599,8 @@ class TestOAuthFunctionality:
 
         result = await admin_edit_gateway("gateway-1", mock_request, mock_db, user={"email": "test-user", "db": mock_db})
         assert isinstance(result, JSONResponse)
-        assert result.status_code == 200
+        # ASYNC LIFECYCLE: register_gateway returns 202 Accepted (status=pending)
+        assert result.status_code == 202
 
         gateway_update = mock_update_gateway.call_args.args[2]
         assert gateway_update.auth_type == "oauth"
@@ -6624,7 +6632,8 @@ class TestOAuthFunctionality:
 
         result = await admin_edit_gateway("gateway-1", mock_request, mock_db, user={"email": "test-user", "db": mock_db})
         assert isinstance(result, JSONResponse)
-        assert result.status_code == 200
+        # ASYNC LIFECYCLE: register_gateway returns 202 Accepted (status=pending)
+        assert result.status_code == 202
 
         gateway_update = mock_update_gateway.call_args.args[2]
         assert gateway_update.oauth_config == {"grant_type": "client_credentials"}
@@ -6659,7 +6668,8 @@ class TestOAuthFunctionality:
 
             result = await admin_add_gateway(mock_request, mock_db, user={"email": "test-user", "db": mock_db})
             assert isinstance(result, JSONResponse)
-            assert result.status_code == 200
+            # ASYNC LIFECYCLE: register_gateway returns 202 Accepted (status=pending)
+            assert result.status_code == 202
 
             gateway_create = mock_register_gateway.call_args.args[1]
             assert gateway_create.ca_certificate == "CERT"
@@ -6691,7 +6701,8 @@ class TestOAuthFunctionality:
 
             result = await admin_add_gateway(mock_request, mock_db, user={"email": "test-user", "db": mock_db})
             assert isinstance(result, JSONResponse)
-            assert result.status_code == 200
+            # ASYNC LIFECYCLE: register_gateway returns 202 Accepted (status=pending)
+            assert result.status_code == 202
 
             gateway_create = mock_register_gateway.call_args.args[1]
             assert gateway_create.ca_certificate == "CERT"
