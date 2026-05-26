@@ -1604,6 +1604,14 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             await metrics_rollup_service.start()
             logger.info("Metrics rollup service initialized (interval: %dh)", settings.metrics_rollup_interval_hours)
 
+        # Initialize sunset scheduler service for tool lifecycle management
+        # First-Party
+        from mcpgateway.services.sunset_scheduler_service import get_sunset_scheduler_service  # pylint: disable=import-outside-toplevel
+
+        sunset_scheduler_service = get_sunset_scheduler_service()
+        await sunset_scheduler_service.start()
+        logger.info("Sunset scheduler service initialized (interval: %d minutes)", settings.sunset_scheduler_interval_minutes)
+
         refresh_slugs_on_startup()
 
         # Bootstrap SSO providers from environment configuration
@@ -1807,6 +1815,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
             metrics_cleanup_service = get_metrics_cleanup_service()
             services_to_shutdown.insert(2, metrics_cleanup_service)
+
+        # Add sunset scheduler service (shutdown after metrics services)
+        # First-Party
+        from mcpgateway.services.sunset_scheduler_service import get_sunset_scheduler_service  # pylint: disable=import-outside-toplevel
+
+        sunset_scheduler_service = get_sunset_scheduler_service()
+        services_to_shutdown.insert(3, sunset_scheduler_service)
 
         await shutdown_services(services_to_shutdown)
 
