@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Tests for tool deprecation functionality.
-
+"""Location: ./tests/unit/mcpgateway/services/test_tool_deprecated.py
 Copyright 2026
 SPDX-License-Identifier: Apache-2.0
 
