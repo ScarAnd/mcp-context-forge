@@ -50,7 +50,14 @@
   "users.table.role": "Role",
   "users.table.security": "Security",
   "users.table.status": "Status",
+  "users.table.actions.delete": "Delete",
+  "users.table.actions.edit": "Edit",
+  "users.table.actions.label": "Actions for {name}",
   "users.table.user": "User",
   "users.title": "Users",
+  "users.delete.confirm.button": "Delete",
+  "users.delete.confirm.description": "Are you sure you want to delete {email}? This action cannot be undone.",
+  "users.delete.confirm.title": "Delete User",
+  "users.delete.error": "Failed to delete user. Please try again.",
   "users.unnamed": "Unnamed user"
 }

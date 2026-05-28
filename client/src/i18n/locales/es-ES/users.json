@@ -50,7 +50,14 @@
   "users.table.role": "Rol",
   "users.table.security": "Seguridad",
   "users.table.status": "Estado",
+  "users.table.actions.delete": "Eliminar",
+  "users.table.actions.edit": "Editar",
+  "users.table.actions.label": "Acciones para {name}",
   "users.table.user": "Usuario",
   "users.title": "Usuarios",
+  "users.delete.confirm.button": "Eliminar",
+  "users.delete.confirm.description": "¿Está seguro de que desea eliminar {email}? Esta acción no se puede deshacer.",
+  "users.delete.confirm.title": "Eliminar Usuario",
+  "users.delete.error": "Error al eliminar el usuario. Por favor, inténtelo de nuevo.",
   "users.unnamed": "Usuario sin nombre"
 }

@@ -4,7 +4,10 @@ import { useIntl } from "react-intl";
 import { Button } from "@/components/ui/button";
 import { UserForm } from "@/components/users/UserForm";
 import { UsersTable } from "@/components/users/UsersTable";
+import { ConfirmDialog } from "@/components/servers/ConfirmDialog";
 import { useQuery } from "@/hooks/useQuery";
+import { api } from "@/api/client";
+import { sanitizeError } from "@/utils/errors";
 import type { User, UsersResponse, CreateUserRequest } from "@/types/user";
 
 const DEFAULT_PAGE_SIZE = 10;
@@ -15,6 +18,9 @@ export function Users() {
   const [allUsers, setAllUsers] = useState<User[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [isFormOpen, setIsFormOpen] = useState(false);
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+  const [selectedEmail, setSelectedEmail] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   const queryPath = useMemo(() => {
     const params = new URLSearchParams();
@@ -71,6 +77,24 @@ export function Users() {
   const handleLimitChange = useCallback((newLimit: number) => {
     setLimit(newLimit);
   }, []);
+
+  const handleDelete = useCallback((email: string) => {
+    setSelectedEmail(email);
+    setDeleteDialogOpen(true);
+  }, []);
+
+  const confirmDelete = useCallback(async () => {
+    if (!selectedEmail) return;
+    setDeleteDialogOpen(false);
+    setDeleteError(null);
+    try {
+      await api.delete(`/auth/email/admin/users/${encodeURIComponent(selectedEmail)}`);
+      setAllUsers((prev) => prev.filter((u) => u.email !== selectedEmail));
+      setSelectedEmail(null);
+    } catch (err) {
+      setDeleteError(sanitizeError(err));
+    }
+  }, [selectedEmail]);
 
   const error = queryError ? queryError.message : null;
 
@@ -149,9 +173,20 @@ export function Users() {
                 </div>
               )}
 
+              {deleteError && (
+                <div
+                  className="rounded-lg border border-destructive/20 bg-destructive/10 p-4"
+                  role="alert"
+                  aria-live="assertive"
+                  aria-atomic="true"
+                >
+                  <p className="text-destructive">{deleteError}</p>
+                </div>
+              )}
+
               {allUsers.length > 0 ? (
                 <>
-                  <UsersTable users={allUsers} />
+                  <UsersTable users={allUsers} onDelete={handleDelete} />
 
                   <div className="mt-6 flex items-center justify-between">
                     <div className="flex items-center gap-4">
@@ -204,6 +239,19 @@ export function Users() {
           )}
         </div>
       )}
+      <ConfirmDialog
+        open={deleteDialogOpen}
+        onOpenChange={setDeleteDialogOpen}
+        title={intl.formatMessage({ id: "users.delete.confirm.title" })}
+        description={intl.formatMessage(
+          { id: "users.delete.confirm.description" },
+          { email: selectedEmail ?? "" },
+        )}
+        confirmLabel={intl.formatMessage({ id: "users.delete.confirm.button" })}
+        cancelLabel={intl.formatMessage({ id: "users.form.button.cancel" })}
+        variant="destructive"
+        onConfirm={confirmDelete}
+      />
     </main>
   );
 }
