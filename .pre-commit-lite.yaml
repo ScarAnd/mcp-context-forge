@@ -62,6 +62,7 @@ repos:
   # -----------------------------------------------------------------------------
   - repo: local
     hooks:
+
       - id: alembic-check-heads
         name: 🔄 Alembic - Check for Multiple Heads
         description: Ensures there is only one Alembic migration head (prevents migration conflicts).
@@ -79,6 +80,14 @@ repos:
         pass_filenames: false
         always_run: true
         files: ^mcpgateway/alembic/versions/.*\.py$
+
+      - id: remove-tabs
+        name: 🚀 Remove Tabs
+        description: Replaces tab characters with 4 spaces.
+        entry: python scripts/pre-commit/remove_tabs.py
+        language: python
+        types: [text]
+        exclude: '(^|/)Makefile$|(\.mk|\.jinja|\.jinja2|\.j2)$'
 
       - id: forbid-content-reference
         name: ❌ Forbid :contentReference
@@ -467,21 +476,6 @@ repos:
   #       description: A mighty, modern linter that helps you avoid errors and enforce conventions in your styles.
   #       files: \.(css|scss|sass|less)$
 
-  # -----------------------------------------------------------------------------
-  # 🚀 Performance and Optimization Hooks (MODIFIES FILES)
-  # -----------------------------------------------------------------------------
-  - repo: https://github.com/Lucas-C/pre-commit-hooks
-    rev: v1.5.5
-    hooks:
-      - id: remove-crlf
-        name: 🚀 Remove CRLF
-        description: Replaces CRLF line endings by LF.
-
-      - id: remove-tabs
-        name: 🚀 Remove Tabs
-        description: Replaces tabs by whitespaces.
-        # exclude root-level Makefiles and any path ending in /Makefile or .mk or .jinja
-        exclude: '(^|/)Makefile$|(\.mk|\.jinja)$'
 
   # -----------------------------------------------------------------------------
   # 🚫 Branch Protection Hooks
