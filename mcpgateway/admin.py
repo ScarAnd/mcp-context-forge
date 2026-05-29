@@ -3215,6 +3215,7 @@ async def admin_delete_server(server_id: str, request: Request, db: Session = De
 @admin_router.get("/resources", response_model=PaginatedResponse)
 @require_permission("resources.read", allow_admin_bypass=False)
 async def admin_list_resources(
+    request: Request,
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
     per_page: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Items per page"),
     include_inactive: bool = False,
@@ -3228,6 +3229,7 @@ async def admin_list_resources(
     including those that are inactive. Uses offset-based (page/per_page) pagination.
 
     Args:
+        request (Request): FastAPI request object (required for token team extraction via request.state.token_teams).
         page (int): Page number (1-indexed). Default: 1.
         per_page (int): Items per page. Default: 50.
         include_inactive (bool): Whether to include inactive resources in the results.
@@ -3243,8 +3245,9 @@ async def admin_list_resources(
         >>> admin_list_resources.__name__
         'admin_list_resources'
     """
-    LOGGER.debug(f"User {get_user_email(user)} requested resource list (page={page}, per_page={per_page})")
     user_email = get_user_email(user)
+    token_teams = get_token_teams_from_request(request)
+    LOGGER.debug(f"User {user_email} requested resource list (page={page}, per_page={per_page})")
 
     # Call resource_service.list_resources with page-based pagination
     paginated_result = await resource_service.list_resources(
@@ -3253,6 +3256,7 @@ async def admin_list_resources(
         page=page,
         per_page=per_page,
         user_email=user_email,
+        token_teams=token_teams,
     )
 
     # Return standardized paginated response
@@ -3266,6 +3270,7 @@ async def admin_list_resources(
 @admin_router.get("/prompts", response_model=PaginatedResponse)
 @require_permission("prompts.read", allow_admin_bypass=False)
 async def admin_list_prompts(
+    request: Request,
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
     per_page: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Items per page"),
     include_inactive: bool = False,
@@ -3279,6 +3284,7 @@ async def admin_list_prompts(
     including those that are inactive. Uses offset-based (page/per_page) pagination.
 
     Args:
+        request (Request): FastAPI request object (required for token team extraction via request.state.token_teams).
         page (int): Page number (1-indexed) for offset pagination.
         per_page (int): Number of items per page.
         include_inactive (bool): Whether to include inactive prompts in the results.
@@ -3297,8 +3303,9 @@ async def admin_list_prompts(
         >>> admin_list_prompts.__name__
         'admin_list_prompts'
     """
-    LOGGER.debug(f"User {get_user_email(user)} requested prompt list (page={page}, per_page={per_page})")
     user_email = get_user_email(user)
+    token_teams = get_token_teams_from_request(request)
+    LOGGER.debug(f"User {user_email} requested prompt list (page={page}, per_page={per_page})")
 
     # Call prompt_service.list_prompts with page-based pagination
     paginated_result = await prompt_service.list_prompts(
@@ -3307,6 +3314,7 @@ async def admin_list_prompts(
         page=page,
         per_page=per_page,
         user_email=user_email,
+        token_teams=token_teams,
     )
 
     # Return standardized paginated response
@@ -8347,6 +8355,7 @@ async def admin_force_password_change(
 @admin_router.get("/tools", response_model=PaginatedResponse)
 @require_permission("tools.read", allow_admin_bypass=False)
 async def admin_list_tools(
+    request: Request,
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
     per_page: int = Query(settings.pagination_default_page_size, ge=1, le=settings.pagination_max_page_size, description="Items per page"),
     include_inactive: bool = False,
@@ -8360,6 +8369,7 @@ async def admin_list_tools(
     including those that are inactive. Uses offset-based (page/per_page) pagination.
 
     Args:
+        request (Request): FastAPI request object (required for token team extraction via request.state.token_teams).
         page (int): Page number (1-indexed). Default: 1.
         per_page (int): Items per page. Default: 50.
         include_inactive (bool): Whether to include inactive tools in the results.
@@ -8370,8 +8380,9 @@ async def admin_list_tools(
         Dict with 'data', 'pagination', and 'links' keys containing paginated tools.
 
     """
-    LOGGER.debug(f"User {get_user_email(user)} requested tool list (page={page}, per_page={per_page})")
     user_email = get_user_email(user)
+    token_teams = get_token_teams_from_request(request)
+    LOGGER.debug(f"User {user_email} requested tool list (page={page}, per_page={per_page})")
     _is_admin = bool(user.get("is_admin", False) if isinstance(user, dict) else getattr(user, "is_admin", False))
     _team_roles = _get_user_team_roles(db, user_email) if not _is_admin else {}
 
@@ -8382,6 +8393,7 @@ async def admin_list_tools(
         page=page,
         per_page=per_page,
         user_email=user_email,
+        token_teams=token_teams,
         requesting_user_email=user_email,
         requesting_user_is_admin=_is_admin,
         requesting_user_team_roles=_team_roles,
@@ -16632,6 +16644,7 @@ async def admin_get_grpc_methods(
 @admin_router.get("/sections/resources")
 @require_permission("resources.read", allow_admin_bypass=False)
 async def get_resources_section(
+    request: Request,
     team_id: Optional[str] = None,
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
@@ -16639,6 +16652,7 @@ async def get_resources_section(
     """Get resources data filtered by team.
 
     Args:
+        request: FastAPI request object
         team_id: Optional team ID to filter by
         db: Database session
         user: Current authenticated user context
@@ -16648,11 +16662,16 @@ async def get_resources_section(
     """
     try:
         local_resource_service = ResourceService()
-        user_email = get_user_email(user)
-        LOGGER.debug(f"User {user_email} requesting resources section with team_id={team_id}")
+        user_email, token_teams = get_scoped_resource_access_context(request, user)
+        LOGGER.debug(f"User {user_email} requesting resources section with team_id={team_id}, token_teams={token_teams}")
 
-        # Get all resources and filter by team
-        resources_result = await local_resource_service.list_resources(db, include_inactive=True)
+        # Get all resources with token_teams for proper scoping
+        resources_result = await local_resource_service.list_resources(
+            db,
+            include_inactive=True,
+            user_email=user_email,
+            token_teams=token_teams
+        )
         if isinstance(resources_result, tuple):
             resources_list = resources_result[0]
         else:
@@ -16691,6 +16710,7 @@ async def get_resources_section(
 @admin_router.get("/sections/prompts")
 @require_permission("prompts.read", allow_admin_bypass=False)
 async def get_prompts_section(
+    request: Request,
     team_id: Optional[str] = None,
     db: Session = Depends(get_db),
     user=Depends(get_current_user_with_permissions),
@@ -16698,6 +16718,7 @@ async def get_prompts_section(
     """Get prompts data filtered by team.
 
     Args:
+        request: FastAPI request object
         team_id: Optional team ID to filter by
         db: Database session
         user: Current authenticated user context
@@ -16707,11 +16728,16 @@ async def get_prompts_section(
     """
     try:
         local_prompt_service = PromptService()
-        user_email = get_user_email(user)
-        LOGGER.debug(f"User {user_email} requesting prompts section with team_id={team_id}")
+        user_email, token_teams = get_scoped_resource_access_context(request, user)
+        LOGGER.debug(f"User {user_email} requesting prompts section with team_id={team_id}, token_teams={token_teams}")
 
-        # Get all prompts and filter by team
-        prompts_result = await local_prompt_service.list_prompts(db, include_inactive=True)
+        # Get all prompts with token_teams for proper scoping
+        prompts_result = await local_prompt_service.list_prompts(
+            db,
+            include_inactive=True,
+            user_email=user_email,
+            token_teams=token_teams
+        )
         if isinstance(prompts_result, tuple):
             prompts_list = prompts_result[0]
         else:
