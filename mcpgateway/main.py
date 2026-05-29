@@ -178,6 +178,7 @@ from mcpgateway.services.prompt_service import PromptError, PromptLockConflictEr
 from mcpgateway.services.resource_service import ResourceError, ResourceLockConflictError, ResourceNotFoundError, ResourceURIConflictError
 from mcpgateway.services.server_service import ServerError, ServerLockConflictError, ServerNameConflictError, ServerNotFoundError
 from mcpgateway.services.tag_service import TagService
+from mcpgateway.services.dataplane_publisher import DataplanePublisherService
 from mcpgateway.services.tool_service import ToolError, ToolLockConflictError, ToolNameConflictError, ToolNotFoundError
 from mcpgateway.transports.sse_transport import SSETransport
 from mcpgateway.transports.streamablehttp_transport import (
@@ -1315,6 +1316,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     aggregation_loop_task: Optional[asyncio.Task] = None
     aggregation_backfill_task: Optional[asyncio.Task] = None
     siem_export_service: Optional[Any] = None
+    dataplane_publisher_service: Optional[Any] = None
 
     # Initialize logging service FIRST to ensure all logging goes to dual output
     await logging_service.initialize()
@@ -1606,6 +1608,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
         refresh_slugs_on_startup()
 
+        # Initialize experimental dataplane publisher to send config data to redis
+        if settings.dataplane_publisher:
+            dataplane_publisher_service = DataplanePublisherService()
+            await dataplane_publisher_service.start()
         # Bootstrap SSO providers from environment configuration
         if settings.sso_enabled:
             await attempt_to_bootstrap_sso_providers()
@@ -1663,7 +1669,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 Raises:
                     asyncio.CancelledError: When aggregation is stopped
                 """
-                interval_seconds = max(1, int(settings.metrics_aggregation_window_minutes)) * 60
+                interval_seconds = settings.metrics_aggregation_interval_seconds or max(1, int(settings.metrics_aggregation_window_minutes)) * 60
                 logger.info(
                     "Starting log aggregation loop (window=%s min)",
                     log_aggregator.aggregation_window_minutes,
@@ -1807,6 +1813,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
             metrics_cleanup_service = get_metrics_cleanup_service()
             services_to_shutdown.insert(2, metrics_cleanup_service)
+
+        if dataplane_publisher_service is not None:
+            services_to_shutdown.insert(3, dataplane_publisher_service)
 
         await shutdown_services(services_to_shutdown)
 
@@ -2820,8 +2829,10 @@ class MCPPathRewriteMiddleware:
     """
     Middleware that rewrites paths ending with '/mcp' to '/mcp/', after performing authentication.
 
+    - Rewrites exact '/mcp' to '/mcp/' so Starlette's mount does not emit a 307 redirect.
     - Rewrites paths like '/servers/<server_id>/mcp' to '/mcp/'.
-    - Only paths ending with '/mcp' or '/mcp/' (but not exactly '/mcp' or '/mcp/') are rewritten.
+    - Keeps ASGI ``raw_path`` aligned with rewritten paths when present.
+    - Only exact '/mcp' and server-scoped MCP transport paths are rewritten.
     - Authentication is performed before any path rewriting.
     - If authentication fails, the request is not processed further.
     - All other requests are passed through without change.
@@ -2938,6 +2949,13 @@ class MCPPathRewriteMiddleware:
             >>> with patch('mcpgateway.main.streamable_http_auth', return_value=True):
             ...     asyncio.run(middleware._call_streamable_http(scope, receive, send))
             >>> app_mock.assert_called_once_with(scope, receive, send)
+
+            >>> # Exact /mcp is normalized to avoid Starlette's mount redirect.
+            >>> scope = {"type": "http", "path": "/mcp"}
+            >>> with patch('mcpgateway.main.streamable_http_auth', return_value=True):
+            ...     asyncio.run(middleware._call_streamable_http(scope, receive, send))
+            >>> scope["path"]
+            '/mcp/'
         """
         # Auth check first
         auth_ok = await streamable_http_auth(scope, receive, send)
@@ -2961,7 +2979,11 @@ class MCPPathRewriteMiddleware:
         # Skip rewriting for well-known URIs (RFC 9728 OAuth metadata, etc.)
         # These paths may end with /mcp but should not be rewritten to the MCP transport
         if not app_path.startswith("/.well-known/"):
-            if (app_path.endswith("/mcp") and app_path != "/mcp") or (app_path.endswith("/mcp/") and app_path != "/mcp/"):
+            if app_path == "/mcp":
+                self._apply_mcp_rewrite(scope, root_path)
+                await self.application(scope, receive, send)
+                return
+            if app_path.endswith("/mcp") or (app_path.endswith("/mcp/") and app_path != "/mcp/"):
                 # SECURITY: Only rewrite recognised MCP paths — /servers/{id}/mcp.
                 # Arbitrary prefixes (e.g. /foo/mcp) must NOT be rewritten to
                 # /mcp/ as that would expose the global MCP transport under
@@ -2982,10 +3004,27 @@ class MCPPathRewriteMiddleware:
                     return
                 # Rewrite to /mcp/ and continue through middleware (lets CORSMiddleware handle preflight)
                 # Preserve root_path prefix when rewriting
-                scope["path"] = f"{root_path}/mcp/" if root_path else "/mcp/"
+                self._apply_mcp_rewrite(scope, root_path)
                 await self.application(scope, receive, send)
                 return
         await self.application(scope, receive, send)
+
+    @staticmethod
+    def _apply_mcp_rewrite(scope, root_path: str) -> str:
+        """Rewrite a validated MCP transport path to the mounted /mcp/ app path."""
+        original_path = scope.get("path", "")
+        new_path = f"{root_path}/mcp/" if root_path else "/mcp/"
+        scope["path"] = new_path
+
+        if "raw_path" in scope:
+            try:
+                # ASGI raw_path stores raw octets; latin-1 preserves a 1:1 byte mapping for valid values.
+                scope["raw_path"] = new_path.encode("latin-1")
+            except (UnicodeEncodeError, ValueError):
+                logger.warning("MCPPathRewriteMiddleware: non-latin-1 raw_path skipped for %s", new_path)
+
+        logger.debug("MCPPathRewriteMiddleware: %s -> %s", original_path, new_path)
+        return new_path
 
 
 # Configure CORS with environment-aware origins

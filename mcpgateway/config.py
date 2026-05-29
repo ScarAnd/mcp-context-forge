@@ -749,6 +749,12 @@ class Settings(BaseSettings):
             "Default true for maximum security (test only what's already registered)."
         ),
     )
+    gateway_test_dns_timeout: float = Field(
+        default=5.0,
+        gt=0.0,
+        le=30.0,
+        description="Timeout in seconds for DNS resolution performed during /admin/gateways/test validation.",
+    )
 
     # UAID Cross-Gateway Routing Security
     uaid_allowed_domains: List[str] = Field(
@@ -1937,6 +1943,15 @@ class Settings(BaseSettings):
     metrics_aggregation_backfill_hours: int = Field(default=6, ge=0, le=168, description="Hours of structured logs to backfill into performance metrics on startup")
     metrics_aggregation_window_minutes: int = Field(default=5, description="Time window for metrics aggregation (minutes)")
     metrics_aggregation_auto_start: bool = Field(default=False, description="Automatically run the log aggregation loop on application startup")
+    metrics_aggregation_interval_seconds: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Seconds between aggregation runs. "
+            "Defaults to metrics_aggregation_window_minutes * 60 when unset. "
+            "Set higher (e.g. 900) to reduce background DB pressure on multi-worker deployments."
+        ),
+    )
     yield_batch_size: int = Field(
         default=1000,
         ge=100,
@@ -2656,8 +2671,6 @@ class Settings(BaseSettings):
     otel_bsp_schedule_delay: int = Field(default=5000, description="Schedule delay in milliseconds")
 
     # ===================================
-
-    # ===================================
     # OpenTelemetry Baggage Configuration
     # ===================================
 
@@ -2696,6 +2709,14 @@ class Settings(BaseSettings):
     otel_baggage_log_sanitization: bool = Field(
         default=True,
         description="Log sanitization events for compliance tracking",
+    )
+
+    # ===================================
+    # Experimental dataplane config
+    # ===================================
+
+    dataplane_publisher: bool = Field(default=False,
+        description="Send data from CF to Rust experimental dataplane"
     )
 
     # Well-Known URI Configuration
