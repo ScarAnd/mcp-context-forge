@@ -1058,6 +1058,7 @@ class ToolService(BaseService):
             "gateway_id": str(tool.gateway_id) if tool.gateway_id else None,
             "grpc_service_id": str(tool.grpc_service_id) if tool.grpc_service_id else None,
             "enabled": bool(tool.enabled),
+            "deprecated": bool(tool.deprecated),
             "reachable": bool(tool.reachable),
             "tags": tool.tags or [],
             "team_id": tool.team_id,
@@ -1090,6 +1091,7 @@ class ToolService(BaseService):
                 "gateway_mode": getattr(gateway, "gateway_mode", "cache"),  # Gateway mode for direct proxy support
                 "client_cert": getattr(gateway, "client_cert", None),
                 "client_key": getattr(gateway, "client_key", None),
+                "auth_value": getattr(gateway, "auth_value", None),
             }
 
         return {"status": "active", "tool": tool_payload, "gateway": gateway_payload}
@@ -4364,6 +4366,14 @@ class ToolService(BaseService):
         # pylint: disable=comparison-with-callable
         logger.info(f"Invoking tool: {name} with arguments: {arguments.keys() if arguments else None} and headers: {request_headers.keys() if request_headers else None}, server_id={server_id}")
         # ═══════════════════════════════════════════════════════════════════════════
+        # PHASE 0: Set request_headers_var ContextVar so downstream_session_id_from_request_context() can access it
+        # This is needed for upstream session registry to work correctly
+        # ═══════════════════════════════════════════════════════════════════════════
+        # First-Party
+        from mcpgateway.transports.context import request_headers_var  # pylint: disable=import-outside-toplevel
+        if request_headers:
+            request_headers_var.set(request_headers)
+        # ═══════════════════════════════════════════════════════════════════════════
         # PHASE 1: Check for X-Context-Forge-Gateway-Id header for direct_proxy mode (no DB lookup)
         # ═══════════════════════════════════════════════════════════════════════════
         gateway_id_from_header = extract_gateway_id_from_headers(request_headers)
@@ -4503,6 +4513,12 @@ class ToolService(BaseService):
             if not await self._check_tool_access(db, tool_payload, user_email, token_teams):
                 # Don't reveal tool existence - return generic "not found"
                 raise ToolNotFoundError(f"Tool not found: {name}")
+
+            # Check deprecated status after RBAC to avoid leaking tool existence
+            if tool_payload.get("deprecated") is True:
+                # Cache the deprecated status to avoid repeated DB queries
+                await tool_lookup_cache.set_negative(name, "deprecated")
+                raise ToolInvocationError(f"Tool '{name}' is deprecated and cannot be executed. Please update your agent to use an alternative tool.")
 
             # ═══════════════════════════════════════════════════════════════════════════
             # SECURITY: Enforce server scoping if server_id is provided

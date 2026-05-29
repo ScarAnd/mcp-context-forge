@@ -1998,8 +1998,27 @@ async def _get_request_context_or_default() -> Tuple[str, dict[str, Any], dict[s
     s_id = server_id_var.get()
 
     # Check if context vars are populated with real data (not defaults)
+    # Only use ContextVars if they contain the enriched headers with session ID
+    # If session ID is missing, fall through to ASGI scope (Path 2) which has enriched headers
     if s_id != "default_server_id":
-        return s_id, request_headers_var.get(), user_context_var.get()
+        headers = request_headers_var.get()
+        session_id = headers.get("x-mcp-session-id") if headers else None
+
+        # If we have a server_id but no session ID in headers, the ContextVars were captured
+        # before enrichment. Fall through to ASGI scope which has the enriched headers.
+        if not session_id:
+            logger.debug(
+                "[CONTEXT_RESOLUTION] Path 1 skipped (no session ID) | server_id=%s | falling through to ASGI scope",
+                s_id[:8] if s_id else None,
+            )
+            # Don't return - fall through to Path 2 (ASGI scope)
+        else:
+            logger.debug(
+                "[CONTEXT_RESOLUTION] Path 1 (ContextVars) | server_id=%s | has_session_id=%s",
+                s_id[:8] if s_id else None,
+                bool(session_id),
+            )
+            return s_id, headers, user_context_var.get()
 
     # 2. Try ASGI scope context injected by handle_streamable_http()
     ctx = None
@@ -3804,20 +3823,30 @@ class SessionManagerWrapper:
             receive: ASGI receive callable.
 
         Returns:
-            Request body bytes, or None if client disconnected.
+            Request body bytes, or None if client disconnected or body exceeds size limit.
         """
+        MAX_BODY_BYTES = 16 * 1024 * 1024  # 16MB limit for affinity forwarding
         body_parts = []
+        total = 0
         while True:
             message = await receive()
             if message["type"] == "http.request":
-                body_parts.append(message.get("body", b""))
+                chunk = message.get("body", b"")
+                total += len(chunk)
+                if total > MAX_BODY_BYTES:
+                    logger.warning("Request body exceeds %d bytes limit, rejecting", MAX_BODY_BYTES)
+                    return None
+                body_parts.append(chunk)
                 if not message.get("more_body", False):
                     break
             elif message["type"] == "http.disconnect":
                 return None
+            else:
+                logger.debug("_read_request_body: unexpected ASGI event %s, skipping", message.get("type"))
         return b"".join(body_parts)
 
-    async def _validate_server_id(self, match: "re.Match[str] | None", path: str, scope: Scope, receive: Receive, send: Send) -> str | None:
+    @staticmethod
+    async def _validate_server_id(match: "re.Match[str] | None", path: str, scope: Scope, receive: Receive, send: Send) -> str | None:
         """Validate and resolve the server_id from the request path.
 
         Args:
@@ -3981,7 +4010,7 @@ class SessionManagerWrapper:
         Returns:
             True if request was handled, False to fall through to SDK.
         """
-        logger.debug("[HTTP_AFFINITY_FORWARDED] Received forwarded request | Method: %s | Session: %s", method, mcp_session_id)
+        logger.debug("[HTTP_AFFINITY_FORWARDED] Received forwarded request | Method: %s | Session: %s...", method, mcp_session_id[:8])
 
         # Only route POST requests with JSON-RPC body to /rpc
         if method != "POST":
@@ -4161,8 +4190,8 @@ class SessionManagerWrapper:
             if owner == WORKER_ID:
                 logger.debug("[HTTP_AFFINITY] Worker %s | Session %s... | Owner is us but method is %s, falling through to SDK", WORKER_ID, mcp_session_id[:8], method)
 
-        except RuntimeError:
-            pass
+        except RuntimeError as exc:
+            logger.debug("Session affinity pool RuntimeError, proceeding locally: %r", exc)
         except Exception as e:
             logger.debug("Session affinity check failed, proceeding locally: %s", e)
 
@@ -4400,7 +4429,20 @@ class SessionManagerWrapper:
         user_context: dict[str, Any],
         is_internally_forwarded: bool,
     ) -> None:
-        """Handle SDK fallthrough for requests not handled by specific handlers."""
+        """Handle SDK fallthrough for requests not handled by specific handlers.
+
+        Args:
+            scope: ASGI scope dict.
+            receive: ASGI receive callable.
+            send: ASGI send callable.
+            method: HTTP method.
+            mcp_session_id: MCP session ID from headers.
+            headers: Request headers dict.
+            path: Request path.
+            validated: Validated server ID.
+            user_context: User context dict.
+            is_internally_forwarded: Whether request is internally forwarded.
+        """
         # Store context for SDK
         request_headers_var.set(headers)
         server_id_var.set(validated)

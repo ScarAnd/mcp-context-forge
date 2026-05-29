@@ -22,9 +22,10 @@ import pytest
 
 # First-Party
 from mcpgateway.config import Settings
-from mcpgateway.utils.create_jwt_token import _create_jwt_token
 
 # Local
+from tests.helpers.api_helpers import ApiTestHelper
+from tests.helpers.auth import make_test_jwt
 from .pages.admin_page import AdminPage
 from .pages.agents_page import AgentsPage
 from .pages.gateways_page import GatewaysPage
@@ -181,7 +182,7 @@ def _set_admin_jwt_cookie(page: Page, email: str) -> None:
     (required by SRI integrity attributes).
     """
     try:
-        token = _create_jwt_token({"sub": email}, user_data={"email": email, "is_admin": True, "auth_provider": "local"}, teams=None)
+        token = make_test_jwt(email, is_admin=True, teams=None)
     except Exception as exc:  # pragma: no cover - should only fail on misconfig
         raise AssertionError(f"Failed to create admin JWT token: {exc}") from exc
 
@@ -218,6 +219,20 @@ def _ensure_admin_logged_in(page: Page, base_url: str) -> None:
         _set_admin_jwt_cookie(page, admin_email)
         _goto_admin(page, "/admin/")
         _wait_for_admin_transition(page)
+        # Password change enforcement middleware redirects even JWT-cookie sessions
+        # when the user has password_change_required=True (e.g. fresh Docker stack).
+        # Try each candidate password in order (ADMIN_PASSWORD, ADMIN_NEW_PASSWORD,
+        # configured_password which defaults to "changeme" matching Docker defaults).
+        if login_page.is_on_change_password_page():
+            for _pw_candidate in _candidate_admin_passwords(settings, ADMIN_ACTIVE_PASSWORD[0]):
+                login_page.submit_password_change(_pw_candidate, ADMIN_NEW_PASSWORD)
+                _wait_for_admin_transition(page)
+                if not login_page.is_on_change_password_page():
+                    ADMIN_ACTIVE_PASSWORD[0] = ADMIN_NEW_PASSWORD
+                    _set_admin_jwt_cookie(page, admin_email)
+                    _goto_admin(page, "/admin/")
+                    _wait_for_admin_transition(page)
+                    break
     else:
         # ---- Fallback: interactive form login (JWT disabled) ----
         _goto_admin(page, "/admin")
@@ -282,6 +297,20 @@ def _ensure_admin_logged_in(page: Page, base_url: str) -> None:
             page.wait_for_selector('[data-testid="servers-tab"]', state="visible", timeout=30000)
             return
 
+        if login_page.is_on_change_password_page() and not DISABLE_JWT_FALLBACK:
+            # Recovery: password change enforcement redirected mid-load (race condition).
+            for _pw_candidate in _candidate_admin_passwords(settings, ADMIN_ACTIVE_PASSWORD[0]):
+                login_page.submit_password_change(_pw_candidate, ADMIN_NEW_PASSWORD)
+                _wait_for_admin_transition(page)
+                if not login_page.is_on_change_password_page():
+                    ADMIN_ACTIVE_PASSWORD[0] = ADMIN_NEW_PASSWORD
+                    _set_admin_jwt_cookie(page, admin_email)
+                    _goto_admin(page, "/admin/")
+                    _wait_for_admin_transition(page)
+                    break
+            page.wait_for_selector('[data-testid="servers-tab"]', state="visible", timeout=30000)
+            return
+
         content = page.content()
         if "Internal Server Error" in content:
             raise AssertionError("Admin page failed to load: Internal Server Error (500)")
@@ -300,32 +329,27 @@ def _ensure_admin_logged_in(page: Page, base_url: str) -> None:
 @pytest.fixture(scope="session")
 def api_request_context(playwright: Playwright) -> Generator[APIRequestContext, None, None]:
     """Create API request context with optional bearer token."""
-    headers = {"Accept": "application/json"}
-
     token = API_TOKEN
     if not token and not DISABLE_JWT_FALLBACK:
         # Generate a fallback admin token for testing if none provided
         try:
-            token = _create_jwt_token(
-                {"sub": ADMIN_EMAIL},
-                user_data={
-                    "email": ADMIN_EMAIL,
-                    "full_name": "Test Admin",
-                    "is_admin": True,
-                    "auth_provider": "test",
-                },
-                teams=None,  # Admin bypass: null teams with is_admin=true
+            token = make_test_jwt(
+                ADMIN_EMAIL,
+                is_admin=True,
+                teams=None,
+                auth_provider="test",
+                user_data={"email": ADMIN_EMAIL, "is_admin": True, "auth_provider": "test", "full_name": "Test Admin"},
             )
         except Exception:
             pass  # Use empty if generation fails
 
-    auth_header = _format_auth_header(token)
-    if auth_header:
-        headers["Authorization"] = auth_header
-
-    request_context = playwright.request.new_context(
-        base_url=BASE_URL,
-        extra_http_headers=headers,
+    request_context = (
+        ApiTestHelper.new_context(playwright, BASE_URL, token)
+        if token
+        else playwright.request.new_context(
+            base_url=BASE_URL,
+            extra_http_headers={"Accept": "application/json"},
+        )
     )
     yield request_context
     request_context.dispose()
@@ -634,7 +658,7 @@ def test_gateway_with_oauth_data():
         "oauth_issuer": "http://localhost:3003",
         "oauth_token_url": "http://localhost:3003/token",
         "oauth_client_id": "test-client-id",
-        "oauth_client_secret": "test-client-secret",
+        "oauth_client_secret": "test-client-secret",  # pragma: allowlist secret
         "oauth_scopes": "openid profile email",
     }
 
