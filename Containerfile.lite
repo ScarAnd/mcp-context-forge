@@ -266,7 +266,7 @@ COPY --chmod=0755 scripts/verify-native-extensions.py /tmp/verify-native-extensi
 
 # ----------------------------------------------------------------------------
 # Create and populate virtual environment
-#  - Upgrade pip, setuptools, wheel, pdm, uv
+#  - Upgrade pip, setuptools, wheel, uv
 #  - Install project dependencies and package
 #  - Include observability packages for OpenTelemetry support
 #  - Install plugins from PyPI (cpex-* packages)
@@ -315,7 +315,7 @@ RUN set -euo pipefail \
     && /app/.venv/bin/pip uninstall --yes uv pip setuptools wheel \
     && rm -rf /root/.cache /var/cache/dnf \
     && find /app/.venv -name "*.dist-info" -type d \
-        \( -name "pip-*" -o -name "setuptools-*" -o -name "wheel-*" -o -name "pdm-*" -o -name "uv-*" \) \
+        \( -name "pip-*" -o -name "setuptools-*" -o -name "wheel-*" -o -name "uv-*" \) \
         -exec rm -rf {} + 2>/dev/null || true \
     && rm -rf /app/.venv/share/python-wheels \
     && rm -rf "/app/"*.egg-info /app/build /app/dist /app/.eggs
