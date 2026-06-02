@@ -50,14 +50,6 @@ ARG ENABLE_PROFILING=false
 ARG UBI_BASE=registry.access.redhat.com/ubi10/ubi:10.1-1778562845
 ARG NODEJS_IMAGE=registry.access.redhat.com/ubi10/nodejs-24:10.1-1778561468
 ARG UBI_MINIMAL=registry.access.redhat.com/ubi10/ubi-minimal:10.1-1778576723
-# s390x pre-built wheels image (built by .github/workflows/s390x-wheels.yml)
-ARG S390X_WHEELS_IMAGE=ghcr.io/ibm/mcp-context-forge-s390x-wheels:latest 
-
-###############################################################################
-# s390x wheels stage - pulls pre-built wheels for s390x architecture
-# Only used when building on s390x; other architectures skip this stage
-###############################################################################
-FROM ${S390X_WHEELS_IMAGE} AS s390x-wheels
 
 ###############################################################################
 # Rust builder stage - builds Rust MCP runtime and local native extensions
@@ -261,7 +253,6 @@ RUN if [ "$(uname -m)" = "s390x" ] || [ "$(uname -m)" = "ppc64le" ]; then \
 # ----------------------------------------------------------------------------
 COPY pyproject.toml /app/
 COPY --from=rust-builder /build/native-extension-wheels/ /tmp/local-native-extension-wheels/
-COPY --from=s390x-wheels /wheels /tmp/s390x-wheels/
 COPY --chmod=0755 scripts/verify-native-extensions.py /tmp/verify-native-extensions.py
 
 # ----------------------------------------------------------------------------
