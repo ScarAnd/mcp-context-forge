@@ -47,8 +47,14 @@ permissions:
   actions: read
 
 jobs:
+  ci-decision:
+    uses: ./.github/workflows/secret-baseline-ci-decision.yml
+    with:
+      workflow-file: alembic-upgrade-validation.yml
+
   upgrade-validation:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: ci-decision
+    if: needs.ci-decision.outputs.run-full-ci == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     name: SQLite + PostgreSQL Fresh/Upgrade
     runs-on: ubuntu-latest
     timeout-minutes: 50

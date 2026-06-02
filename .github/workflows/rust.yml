@@ -28,11 +28,18 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
+  ci-decision:
+    uses: ./.github/workflows/secret-baseline-ci-decision.yml
+    with:
+      workflow-file: rust.yml
+
   rust-build:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: ci-decision
+    if: needs.ci-decision.outputs.run-full-ci == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     name: Rust build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -79,7 +86,8 @@ jobs:
         run: make rust-verify-stubs
 
   rust-fmt:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: ci-decision
+    if: needs.ci-decision.outputs.run-full-ci == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     name: Rust fmt
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -108,7 +116,8 @@ jobs:
         run: make rust-fmt-check
 
   rust-clippy:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: ci-decision
+    if: needs.ci-decision.outputs.run-full-ci == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     name: Rust clippy
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -137,7 +146,8 @@ jobs:
         run: make rust-lint
 
   rust-test:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: ci-decision
+    if: needs.ci-decision.outputs.run-full-ci == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     name: Rust test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -167,7 +177,8 @@ jobs:
         run: make rust-test
 
   rust-test-redis:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: ci-decision
+    if: needs.ci-decision.outputs.run-full-ci == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     name: Rust test (Redis-backed paths)
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -207,7 +218,8 @@ jobs:
         run: cargo test -p contextforge_mcp_runtime --test runtime
 
   build-wheels:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: ci-decision
+    if: needs.ci-decision.outputs.run-full-ci == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     name: Build wheels (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -256,7 +268,8 @@ jobs:
           path: crates/**/target/wheels/*.whl
 
   security-audit:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: ci-decision
+    if: needs.ci-decision.outputs.run-full-ci == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     name: Dependency policy
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -273,7 +286,8 @@ jobs:
         run: make rust-deny
 
   supply-chain-vet:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: ci-decision
+    if: needs.ci-decision.outputs.run-full-ci == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     name: Supply-chain vet
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -293,7 +307,8 @@ jobs:
         run: make rust-vet
 
   license-check:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: ci-decision
+    if: needs.ci-decision.outputs.run-full-ci == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     name: License check (workspace)
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -310,7 +325,8 @@ jobs:
         run: make rust-licenses
 
   benchmark-build-check:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: ci-decision
+    if: needs.ci-decision.outputs.run-full-ci == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     name: Benchmarks (build check only)
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -336,7 +352,8 @@ jobs:
         run: make rust-bench-check
 
   coverage:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: ci-decision
+    if: needs.ci-decision.outputs.run-full-ci == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     name: Coverage
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -376,7 +393,8 @@ jobs:
           path: coverage/cobertura.xml
 
   documentation:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: ci-decision
+    if: needs.ci-decision.outputs.run-full-ci == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     name: Documentation
     runs-on: ubuntu-latest
     timeout-minutes: 30

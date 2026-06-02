@@ -1,6 +1,10 @@
 name: Pre-commit Checks
 
 on:
+  push:
+    branches: ["main"]
+    paths:
+      - ".secrets.baseline"
   pull_request:
     types: [opened, synchronize, ready_for_review]
     branches: ["main"]
@@ -24,7 +28,28 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-          fetch-depth: 0
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
+          fetch-depth: 2
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Detect secrets-baseline-only latest commit
+        id: baseline_only
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Secrets-detection-only allowlist. Keep this narrow.
+          # A baseline-only commit changes exactly:
+          #   .secrets.baseline
+          target_sha="${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+          changed_files="$(git diff-tree --no-commit-id --name-only -r "${target_sha}")"
+          if [[ "${changed_files}" == ".secrets.baseline" ]]; then
+            echo "value=true" >> "${GITHUB_OUTPUT}"
+            echo "Latest commit only changes .secrets.baseline; running detect-secrets validation only."
+          else
+            echo "value=false" >> "${GITHUB_OUTPUT}"
+            echo "Latest commit is not secrets-baseline-only; running full pre-commit."
+          fi
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
@@ -32,6 +57,7 @@ jobs:
           python-version: "3.12"
 
       - name: Set up Go
+        if: steps.baseline_only.outputs.value != 'true'
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: "1.25.x"
@@ -40,4 +66,9 @@ jobs:
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
 
       - name: Run pre-commit
+        if: steps.baseline_only.outputs.value != 'true'
         run: make --no-print-directory pre-commit
+
+      - name: Run detect-secrets validation
+        if: steps.baseline_only.outputs.value == 'true'
+        run: make --no-print-directory detect-secrets-hook

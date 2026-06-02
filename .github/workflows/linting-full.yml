@@ -20,11 +20,18 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
+  ci-decision:
+    uses: ./.github/workflows/secret-baseline-ci-decision.yml
+    with:
+      workflow-file: linting-full.yml
+
   linting-full:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: ci-decision
+    if: needs.ci-decision.outputs.run-full-ci == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     name: linting-full
     runs-on: ubuntu-slim
     timeout-minutes: 30

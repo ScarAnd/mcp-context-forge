@@ -15,6 +15,7 @@ on:
     workflow_dispatch:
 
 permissions:
+    actions: read
     contents: read
 
 concurrency:
@@ -26,8 +27,14 @@ env:
     RUST_BACKTRACE: 1
 
 jobs:
+    ci-decision:
+        uses: ./.github/workflows/secret-baseline-ci-decision.yml
+        with:
+            workflow-file: sql-sanitizer.yml
+
     sql-sanitizer-e2e:
-        if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+        needs: ci-decision
+        if: needs.ci-decision.outputs.run-full-ci == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
         name: sql-sanitizer E2E
         runs-on: ubuntu-latest
         timeout-minutes: 30

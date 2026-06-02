@@ -45,13 +45,20 @@ concurrency:
 # Minimal permissions - principle of least privilege
 # -----------------------------------------------------------------
 permissions:
+  actions: read
   contents: read # for actions/checkout
   security-events: write # upload SARIF results
   pull-requests: write # post / overwrite PR comment
 
 jobs:
+  ci-decision:
+    uses: ./.github/workflows/secret-baseline-ci-decision.yml
+    with:
+      workflow-file: dependency-review.yml
+
   dependency-review:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: ci-decision
+    if: needs.ci-decision.outputs.run-full-ci == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     runs-on: ubuntu-slim
     timeout-minutes: 15
 

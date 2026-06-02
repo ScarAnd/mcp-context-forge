@@ -12,6 +12,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -19,8 +20,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  ci-decision:
+    uses: ./.github/workflows/secret-baseline-ci-decision.yml
+    with:
+      workflow-file: playwright.yml
+
   playwright-ci-smoke:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: ci-decision
+    if: needs.ci-decision.outputs.run-full-ci == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     name: playwright-ci-smoke
     runs-on: ubuntu-24.04
     timeout-minutes: 40

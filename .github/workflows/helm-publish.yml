@@ -42,15 +42,19 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
-  # -----------------------------------------------------------------------
-  # Lint – always runs to catch chart issues early
-  # -----------------------------------------------------------------------
+  ci-decision:
+    uses: ./.github/workflows/secret-baseline-ci-decision.yml
+    with:
+      workflow-file: helm-publish.yml
+
   lint:
     name: Lint chart
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: ci-decision
+    if: needs.ci-decision.outputs.run-full-ci == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     runs-on: ubuntu-slim
     timeout-minutes: 10
 

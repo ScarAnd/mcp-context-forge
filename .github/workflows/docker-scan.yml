@@ -39,14 +39,21 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
+  actions: read
   contents: read
 
 env:
   IMAGE_NAME: mcp-context-forge-scan
 
 jobs:
+  ci-decision:
+    uses: ./.github/workflows/secret-baseline-ci-decision.yml
+    with:
+      workflow-file: docker-scan.yml
+
   container-smoke:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: ci-decision
+    if: needs.ci-decision.outputs.run-full-ci == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     name: Container Smoke (${{ matrix.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -86,7 +93,8 @@ jobs:
   # Build image and generate SBOM
   # ---------------------------------------------------------------
   scan:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: ci-decision
+    if: needs.ci-decision.outputs.run-full-ci == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     name: Security Scan
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -152,7 +160,8 @@ jobs:
           retention-days: 30
 
   rust-enabled-build:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: ci-decision
+    if: needs.ci-decision.outputs.run-full-ci == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     name: Rust-enabled container smoke
     runs-on: ubuntu-latest
     timeout-minutes: 60

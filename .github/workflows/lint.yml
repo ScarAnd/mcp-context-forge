@@ -24,6 +24,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
+  actions: read
   contents: read
 
 # Keep these pins in lockstep with the *_VERSION variables in the Makefile.
@@ -40,11 +41,14 @@ env:
   TOMLCHECK_VERSION: "0.2.3"
 
 jobs:
-  # ---------------------------------------------------------------
-  # Python linters - run on both mcpgateway/ and plugins/
-  # ---------------------------------------------------------------
+  ci-decision:
+    uses: ./.github/workflows/secret-baseline-ci-decision.yml
+    with:
+      workflow-file: lint.yml
+
   python-lint:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: ci-decision
+    if: needs.ci-decision.outputs.run-full-ci == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     strategy:
       fail-fast: false
       matrix:
@@ -97,7 +101,8 @@ jobs:
   # Repo-wide syntax/format checkers (run once, not per-target)
   # ---------------------------------------------------------------
   syntax-check:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: ci-decision
+    if: needs.ci-decision.outputs.run-full-ci == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     strategy:
       fail-fast: false
       matrix:
