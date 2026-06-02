@@ -109,10 +109,11 @@ from mcpgateway.middleware.request_logging_middleware import RequestLoggingMiddl
 from mcpgateway.middleware.security_headers import SecurityHeadersMiddleware
 from mcpgateway.middleware.token_scoping import token_scoping_middleware
 from mcpgateway.middleware.validation_middleware import ValidationMiddleware
-from mcpgateway.observability import init_telemetry, OpenTelemetryRequestMiddleware, otel_tracing_enabled
+from mcpgateway.observability import configure_baggage_span_attribute_policy, extract_baggage_span_attribute_policy, init_telemetry, OpenTelemetryRequestMiddleware, otel_tracing_enabled
 from mcpgateway.plugins import (
     enable_plugins,
     get_plugin_manager,
+    get_plugin_manager_factory,
     init_plugin_manager_factory,
     shutdown_plugin_manager_factory,
     start_plugin_invalidation_listener,
@@ -177,6 +178,7 @@ from mcpgateway.services.prompt_service import PromptError, PromptLockConflictEr
 from mcpgateway.services.resource_service import ResourceError, ResourceLockConflictError, ResourceNotFoundError, ResourceURIConflictError
 from mcpgateway.services.server_service import ServerError, ServerLockConflictError, ServerNameConflictError, ServerNotFoundError
 from mcpgateway.services.tag_service import TagService
+from mcpgateway.services.dataplane_publisher import DataplanePublisherService
 from mcpgateway.services.tool_service import ToolError, ToolLockConflictError, ToolNameConflictError, ToolNotFoundError
 from mcpgateway.transports.sse_transport import SSETransport
 from mcpgateway.transports.streamablehttp_transport import (
@@ -250,7 +252,16 @@ streamable_http_session = SessionManagerWrapper()
 
 # Wait for redis to be ready
 if settings.cache_type == "redis" and settings.redis_url is not None:
-    wait_for_redis_ready(redis_url=settings.redis_url, max_retries=int(settings.redis_max_retries), retry_interval_ms=int(settings.redis_retry_interval_ms), sync=True)
+    # First-Party
+    from mcpgateway.utils.redis_client import _build_ssl_kwargs
+
+    wait_for_redis_ready(
+        redis_url=settings.redis_url,
+        max_retries=int(settings.redis_max_retries),
+        retry_interval_ms=int(settings.redis_retry_interval_ms),
+        ssl_kwargs=_build_ssl_kwargs(settings),
+        sync=True,
+    )
 
 # Initialize session registry
 session_registry = SessionRegistry(
@@ -1305,6 +1316,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     aggregation_loop_task: Optional[asyncio.Task] = None
     aggregation_backfill_task: Optional[asyncio.Task] = None
     siem_export_service: Optional[Any] = None
+    dataplane_publisher_service: Optional[Any] = None
 
     # Initialize logging service FIRST to ensure all logging goes to dual output
     await logging_service.initialize()
@@ -1425,10 +1437,6 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
         await init_llmchat_redis()
 
-    # Initialize observability (Phoenix tracing)
-    init_telemetry()
-    logger.info("Observability initialized")
-
     try:
         # Validate security configuration
         validate_security_configuration()
@@ -1477,6 +1485,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             from mcpgateway.plugins import mark_factory_init_degraded  # pylint: disable=import-outside-toplevel
 
             mark_factory_init_degraded()
+
+        # Load SpanAttributeCustomizer baggage emission policy before telemetry starts
+        # creating spans. Baggage remains the propagation mechanism; this policy
+        # controls the span attribute names exported from allowed baggage keys.
+        configure_baggage_span_attribute_policy(extract_baggage_span_attribute_policy(get_plugin_manager_factory()))
+        init_telemetry()
+        logger.info("Observability initialized")
 
         try:
             plugin_manager = await get_plugin_manager()
@@ -1593,6 +1608,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
         refresh_slugs_on_startup()
 
+        # Initialize experimental dataplane publisher to send config data to redis
+        if settings.dataplane_publisher:
+            dataplane_publisher_service = DataplanePublisherService()
+            await dataplane_publisher_service.start()
         # Bootstrap SSO providers from environment configuration
         if settings.sso_enabled:
             await attempt_to_bootstrap_sso_providers()
@@ -1650,7 +1669,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 Raises:
                     asyncio.CancelledError: When aggregation is stopped
                 """
-                interval_seconds = max(1, int(settings.metrics_aggregation_window_minutes)) * 60
+                interval_seconds = settings.metrics_aggregation_interval_seconds or max(1, int(settings.metrics_aggregation_window_minutes)) * 60
                 logger.info(
                     "Starting log aggregation loop (window=%s min)",
                     log_aggregator.aggregation_window_minutes,
@@ -1795,6 +1814,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             metrics_cleanup_service = get_metrics_cleanup_service()
             services_to_shutdown.insert(2, metrics_cleanup_service)
 
+        if dataplane_publisher_service is not None:
+            services_to_shutdown.insert(3, dataplane_publisher_service)
+
         await shutdown_services(services_to_shutdown)
 
         # Shutdown session-affinity service (before shared HTTP client).
@@ -1881,6 +1903,17 @@ def validate_security_configuration():
     logger.info("🔒 Validating security configuration...")
     try:
         current_settings = get_settings()
+
+        for _field_name, _secret_field in (
+            ("jwt_secret_key", current_settings.jwt_secret_key),
+            ("auth_encryption_secret", current_settings.auth_encryption_secret),
+        ):
+            _val = _secret_field.get_secret_value()
+            if _val.lower().startswith("__replace_me__"):
+                _msg = f"{_field_name}: Value is an unset placeholder (__REPLACE_ME__). Run 'python -m mcpgateway.scripts.init_secrets' to generate strong values."
+                if str(current_settings.environment).lower() == "production":
+                    raise SecurityConfigurationError(_msg)
+                logger.warning("🔓 SECURITY WARNING - %s", _msg)
 
         security_status: settings.SecurityStatus = current_settings.get_security_status()
         security_warnings = security_status["warnings"]
@@ -2796,8 +2829,10 @@ class MCPPathRewriteMiddleware:
     """
     Middleware that rewrites paths ending with '/mcp' to '/mcp/', after performing authentication.
 
+    - Rewrites exact '/mcp' to '/mcp/' so Starlette's mount does not emit a 307 redirect.
     - Rewrites paths like '/servers/<server_id>/mcp' to '/mcp/'.
-    - Only paths ending with '/mcp' or '/mcp/' (but not exactly '/mcp' or '/mcp/') are rewritten.
+    - Keeps ASGI ``raw_path`` aligned with rewritten paths when present.
+    - Only exact '/mcp' and server-scoped MCP transport paths are rewritten.
     - Authentication is performed before any path rewriting.
     - If authentication fails, the request is not processed further.
     - All other requests are passed through without change.
@@ -2914,6 +2949,13 @@ class MCPPathRewriteMiddleware:
             >>> with patch('mcpgateway.main.streamable_http_auth', return_value=True):
             ...     asyncio.run(middleware._call_streamable_http(scope, receive, send))
             >>> app_mock.assert_called_once_with(scope, receive, send)
+
+            >>> # Exact /mcp is normalized to avoid Starlette's mount redirect.
+            >>> scope = {"type": "http", "path": "/mcp"}
+            >>> with patch('mcpgateway.main.streamable_http_auth', return_value=True):
+            ...     asyncio.run(middleware._call_streamable_http(scope, receive, send))
+            >>> scope["path"]
+            '/mcp/'
         """
         # Auth check first
         auth_ok = await streamable_http_auth(scope, receive, send)
@@ -2937,7 +2979,11 @@ class MCPPathRewriteMiddleware:
         # Skip rewriting for well-known URIs (RFC 9728 OAuth metadata, etc.)
         # These paths may end with /mcp but should not be rewritten to the MCP transport
         if not app_path.startswith("/.well-known/"):
-            if (app_path.endswith("/mcp") and app_path != "/mcp") or (app_path.endswith("/mcp/") and app_path != "/mcp/"):
+            if app_path == "/mcp":
+                self._apply_mcp_rewrite(scope, root_path)
+                await self.application(scope, receive, send)
+                return
+            if app_path.endswith("/mcp") or (app_path.endswith("/mcp/") and app_path != "/mcp/"):
                 # SECURITY: Only rewrite recognised MCP paths — /servers/{id}/mcp.
                 # Arbitrary prefixes (e.g. /foo/mcp) must NOT be rewritten to
                 # /mcp/ as that would expose the global MCP transport under
@@ -2958,10 +3004,27 @@ class MCPPathRewriteMiddleware:
                     return
                 # Rewrite to /mcp/ and continue through middleware (lets CORSMiddleware handle preflight)
                 # Preserve root_path prefix when rewriting
-                scope["path"] = f"{root_path}/mcp/" if root_path else "/mcp/"
+                self._apply_mcp_rewrite(scope, root_path)
                 await self.application(scope, receive, send)
                 return
         await self.application(scope, receive, send)
+
+    @staticmethod
+    def _apply_mcp_rewrite(scope, root_path: str) -> str:
+        """Rewrite a validated MCP transport path to the mounted /mcp/ app path."""
+        original_path = scope.get("path", "")
+        new_path = f"{root_path}/mcp/" if root_path else "/mcp/"
+        scope["path"] = new_path
+
+        if "raw_path" in scope:
+            try:
+                # ASGI raw_path stores raw octets; latin-1 preserves a 1:1 byte mapping for valid values.
+                scope["raw_path"] = new_path.encode("latin-1")
+            except (UnicodeEncodeError, ValueError):
+                logger.warning("MCPPathRewriteMiddleware: non-latin-1 raw_path skipped for %s", new_path)
+
+        logger.debug("MCPPathRewriteMiddleware: %s -> %s", original_path, new_path)
+        return new_path
 
 
 # Configure CORS with environment-aware origins
@@ -3795,8 +3858,9 @@ async def handle_completion(request: Request, db: Session = Depends(get_db), use
     body = await _read_request_json(request)
     logger.debug(f"User {SecurityValidator.sanitize_log_message(user['email'])} sent a completion request")
     user_email, token_teams, is_admin = get_rpc_filter_context(request, user)
+    # Keep user_email set for owner matching on private resources (PR #4341 / issue #4694)
     if is_admin and token_teams is None:
-        user_email = None
+        token_teams = None  # Admin unrestricted - sees all public+team resources + own private
     elif token_teams is None:
         token_teams = []
     try:
@@ -4424,9 +4488,9 @@ async def server_get_tools(
     _req_team_roles = get_user_team_roles(db, _req_email) if _req_email and not _req_is_admin else None
     # Admin bypass - only when token has NO team restrictions (token_teams is None)
     # If token has explicit team scope (even empty [] for public-only), respect it
+    # Keep user_email set for owner matching on private resources (PR #4341 / issue #4694)
     if is_admin and token_teams is None:
-        user_email = None
-        token_teams = None  # Admin unrestricted
+        token_teams = None  # Admin unrestricted - sees all public+team resources + own private
     elif token_teams is None:
         token_teams = []  # Non-admin without teams = public-only (secure default)
     tools = await tool_service.list_server_tools(
@@ -4475,9 +4539,9 @@ async def server_get_resources(
     user_email, token_teams, is_admin = get_rpc_filter_context(request, user)
     # Admin bypass - only when token has NO team restrictions (token_teams is None)
     # If token has explicit team scope (even empty [] for public-only), respect it
+    # Keep user_email set for owner matching on private resources (PR #4341 / issue #4694)
     if is_admin and token_teams is None:
-        user_email = None
-        token_teams = None  # Admin unrestricted
+        token_teams = None  # Admin unrestricted - sees all public+team resources + own private
     elif token_teams is None:
         token_teams = []  # Non-admin without teams = public-only (secure default)
     resources = await resource_service.list_server_resources(
@@ -4518,9 +4582,9 @@ async def server_get_prompts(
     user_email, token_teams, is_admin = get_rpc_filter_context(request, user)
     # Admin bypass - only when token has NO team restrictions (token_teams is None)
     # If token has explicit team scope (even empty [] for public-only), respect it
+    # Keep user_email set for owner matching on private resources (PR #4341 / issue #4694)
     if is_admin and token_teams is None:
-        user_email = None
-        token_teams = None  # Admin unrestricted
+        token_teams = None  # Admin unrestricted - sees all public+team resources + own private
     elif token_teams is None:
         token_teams = []  # Non-admin without teams = public-only (secure default)
     prompts = await prompt_service.list_server_prompts(db, server_id=server_id, include_inactive=include_inactive, include_metrics=include_metrics, user_email=user_email, token_teams=token_teams)
@@ -4579,9 +4643,9 @@ async def list_a2a_agents(
 
     # Admin bypass - only when token has NO team restrictions (token_teams is None)
     # If token has explicit team scope (even for admins), respect it for least-privilege
+    # Keep user_email set for owner matching on private resources (PR #4341 / issue #4694)
     if is_admin and token_teams is None:
-        user_email = None
-        token_teams = None  # Admin unrestricted
+        token_teams = None  # Admin unrestricted - sees all public+team resources + own private
     elif token_teams is None:
         token_teams = []  # Non-admin without teams = public-only (secure default)
 
@@ -4915,6 +4979,24 @@ async def delete_a2a_agent(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+_SENSITIVE_REQUEST_HEADER_PATTERNS = (
+    re.compile(r"^authorization$", re.IGNORECASE),
+    re.compile(r"^proxy-authorization$", re.IGNORECASE),
+    re.compile(r"^x-api-key$", re.IGNORECASE),
+    re.compile(r"^api-key$", re.IGNORECASE),
+    re.compile(r"^apikey$", re.IGNORECASE),
+    re.compile(r"^x-(?:auth|api|access|refresh|client|bearer|session|security)[-_]?(?:token|secret|key)$", re.IGNORECASE),
+    re.compile(r"^cookie$", re.IGNORECASE),
+    re.compile(r"^set-cookie$", re.IGNORECASE),
+    re.compile(r"^host$", re.IGNORECASE),
+)
+
+
+def _filter_sensitive_headers(headers: Dict[str, str]) -> Dict[str, str]:
+    """Strip sensitive/credential headers from a dict before passing to plugins."""
+    return {k: v for k, v in headers.items() if not any(p.match(k) for p in _SENSITIVE_REQUEST_HEADER_PATTERNS)}
+
+
 @a2a_router.post("/{agent_name}/invoke", response_model=Dict[str, Any])
 @require_permission("a2a.invoke")
 async def invoke_a2a_agent(
@@ -4994,6 +5076,11 @@ async def invoke_a2a_agent(
             logger.info("Non-JWT token detected, not forwarding for cross-gateway auth")
             bearer_token = None
 
+        # Extract inbound request metadata for plugin context
+        # Strip sensitive/credential headers before passing to plugins.
+        content_type = request.headers.get("content-type")
+        request_headers = _filter_sensitive_headers({k.lower(): v for k, v in request.headers.items()})
+
         return await a2a_service.invoke_agent(
             db,
             agent_name,
@@ -5004,6 +5091,8 @@ async def invoke_a2a_agent(
             token_teams=token_teams,
             hop_count=hop_count,
             bearer_token=bearer_token,
+            content_type=content_type,
+            request_headers=request_headers,
         )
     except A2AAgentNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -5079,6 +5168,11 @@ async def invoke_a2a_agent_by_id(
             logger.info("Non-JWT token detected, not forwarding for cross-gateway auth")
             bearer_token = None
 
+        # Extract inbound request metadata for plugin context
+        # Strip sensitive/credential headers before passing to plugins.
+        content_type = request.headers.get("content-type")
+        request_headers = _filter_sensitive_headers({k.lower(): v for k, v in request.headers.items()})
+
         return await a2a_service.invoke_agent(
             db,
             agent_name=None,  # Not using name lookup
@@ -5090,6 +5184,8 @@ async def invoke_a2a_agent_by_id(
             token_teams=token_teams,
             hop_count=hop_count,
             bearer_token=bearer_token,
+            content_type=content_type,
+            request_headers=request_headers,
         )
     except A2AAgentNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -5159,9 +5255,9 @@ async def list_tools(
 
     # Admin bypass - only when token has NO team restrictions (token_teams is None)
     # If token has explicit team scope (even for admins), respect it for least-privilege
+    # Keep user_email set for owner matching on private resources (PR #4341 / issue #4694)
     if is_admin and token_teams is None:
-        user_email = None
-        token_teams = None  # Admin unrestricted
+        token_teams = None  # Admin unrestricted - sees all public+team resources + own private
     elif token_teams is None:
         token_teams = []  # Non-admin without teams = public-only (secure default)
 
@@ -5725,9 +5821,9 @@ async def list_resources(
 
     # Admin bypass - only when token has NO team restrictions (token_teams is None)
     # If token has explicit team scope (even for admins), respect it for least-privilege
+    # Keep user_email set for owner matching on private resources (PR #4341 / issue #4694)
     if is_admin and token_teams is None:
-        user_email = None
-        token_teams = None  # Admin unrestricted
+        token_teams = None  # Admin unrestricted - sees all public+team resources + own private
     elif token_teams is None:
         token_teams = []  # Non-admin without teams = public-only (secure default)
 
@@ -6245,9 +6341,9 @@ async def list_prompts(
 
     # Admin bypass - only when token has NO team restrictions (token_teams is None)
     # If token has explicit team scope (even for admins), respect it for least-privilege
+    # Keep user_email set for owner matching on private resources (PR #4341 / issue #4694)
     if is_admin and token_teams is None:
-        user_email = None
-        token_teams = None  # Admin unrestricted
+        token_teams = None  # Admin unrestricted - sees all public+team resources + own private
     elif token_teams is None:
         token_teams = []  # Non-admin without teams = public-only (secure default)
 
@@ -7278,7 +7374,13 @@ async def remove_root(
         Status message indicating result.
     """
     logger.debug(f"User '{SecurityValidator.sanitize_log_message(str(user))}' requested to remove root with URI: {uri}")
-    await root_service.remove_root(uri)
+    try:
+        await root_service.remove_root(uri)
+    except RootServiceNotFoundError as e:
+        raise HTTPException(status_code=404, detail=f"Root not found: {uri}") from e
+    except Exception as e:
+        logger.exception(f"Unexpected error removing root {uri}: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}") from e
     return {"status": "success", "message": f"Root {uri} removed"}
 
 
@@ -10516,10 +10618,17 @@ async def _handle_rpc_authenticated(request: Request, db: Session, user):
                     result = {"contents": [result.model_dump(by_alias=True, exclude_none=True)]}
                 else:
                     result = {"contents": [result]}
-            except (ValueError, ResourceNotFoundError):
+            except (ValueError, ResourceNotFoundError) as e:
                 # Resource not found in the gateway
                 logger.error("Resource not found: %s", uri)
-                raise JSONRPCError(-32002, f"Resource not found: {uri}", {"uri": uri})
+                raise JSONRPCError(-32002, f"Resource not found: {uri}", {"uri": uri}) from e
+            except ResourceError as e:
+                # Other resource errors (ambiguous URI, proxy failures, path validation, etc.)
+                logger.error("Resource read failed: %s", str(e))
+                raise JSONRPCError(-32000, f"Resource read failed: {str(e)}", {"uri": uri}) from e
+            except Exception as e:
+                logger.exception(f"Unexpected error in resources/read for {uri}: {e}")
+                raise JSONRPCError(-32603, f"Internal error: {str(e)}", {"uri": uri}) from e
             # Release transaction after resources/read completes
             db.commit()
             db.close()
@@ -10593,17 +10702,25 @@ async def _handle_rpc_authenticated(request: Request, db: Session, user):
             # Get plugin contexts from request.state for cross-hook sharing
             plugin_context_table = getattr(request.state, "plugin_context_table", None)
             plugin_global_context = getattr(request.state, "plugin_global_context", None)
-            result = await prompt_service.get_prompt(
-                db,
-                name,
-                arguments,
-                user=auth_user_email,
-                server_id=server_id,
-                token_teams=auth_token_teams,
-                plugin_context_table=plugin_context_table,
-                plugin_global_context=plugin_global_context,
-                _meta_data=meta_data,
-            )
+            try:
+                result = await prompt_service.get_prompt(
+                    db,
+                    name,
+                    arguments,
+                    user=auth_user_email,
+                    server_id=server_id,
+                    token_teams=auth_token_teams,
+                    plugin_context_table=plugin_context_table,
+                    plugin_global_context=plugin_global_context,
+                    _meta_data=meta_data,
+                )
+            except PromptNotFoundError as e:
+                raise JSONRPCError(-32002, str(e), {"name": name}) from e
+            except PromptError as e:
+                raise JSONRPCError(-32000, f"Prompt retrieval failed: {str(e)}", {"name": name}) from e
+            except Exception as e:
+                logger.exception(f"Unexpected error in prompts/get for {name}: {e}")
+                raise JSONRPCError(-32603, f"Internal error: {str(e)}", {"name": name}) from e
             if hasattr(result, "model_dump"):
                 result = result.model_dump(by_alias=True, exclude_none=True)
             # Release transaction after prompts/get completes
@@ -11200,7 +11317,11 @@ async def set_log_level(request: Request, user=Depends(get_current_user_with_per
     """
     logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} requested to set log level")
     body = await _read_request_json(request)
-    level = LogLevel(body["level"])
+    try:
+        # Normalize to lowercase before enum construction
+        level = LogLevel(body["level"].lower())
+    except (ValueError, KeyError, AttributeError) as e:
+        raise HTTPException(status_code=422, detail=f"Invalid log level: {body.get('level', 'missing')}") from e
     await logging_service.set_level(level)
 
 
@@ -11908,6 +12029,16 @@ try:
     logger.info("Tool plugin bindings router included")
 except ImportError as e:
     logger.error(f"Tool plugin bindings router not available: {e}")
+
+# A2A agent plugin bindings router
+try:
+    # First-Party
+    from mcpgateway.routers.a2a_agent_plugin_bindings import router as a2a_agent_plugin_bindings_router  # pylint: disable=import-outside-toplevel
+
+    app.include_router(a2a_agent_plugin_bindings_router)
+    logger.info("A2A agent plugin bindings router included")
+except ImportError as e:
+    logger.error(f"A2A agent plugin bindings router not available: {e}")
 
 # Include log search router if structured logging is enabled
 if getattr(settings, "structured_logging_enabled", True):
