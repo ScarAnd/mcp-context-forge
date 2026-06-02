@@ -51,7 +51,7 @@ ARG UBI_BASE=registry.access.redhat.com/ubi10/ubi:10.1-1778562845
 ARG NODEJS_IMAGE=registry.access.redhat.com/ubi10/nodejs-24:10.1-1778561468
 ARG UBI_MINIMAL=registry.access.redhat.com/ubi10/ubi-minimal:10.1-1778576723
 # s390x pre-built wheels image (built by .github/workflows/s390x-wheels.yml)
-ARG S390X_WHEELS_IMAGE=ghcr.io/contextforge-org/contextforge-s390x-wheels:latest
+ARG S390X_WHEELS_IMAGE=ghcr.io/ibm/mcp-context-forge-s390x-wheels:latest 
 
 ###############################################################################
 # s390x wheels stage - pulls pre-built wheels for s390x architecture
