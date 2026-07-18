@@ -5100,9 +5100,22 @@ class _StreamableHttpAuthHandler:
             from mcpgateway.cache.auth_cache import CachedAuthContext, get_auth_cache  # pylint: disable=import-outside-toplevel
 
             jti = user_payload.get("jti")
-            user_email = await _resolve_jwt_user_email_for_streamable(user_payload)
-            if not user_email and settings.require_user_in_db and jwt_subject_is_uuid(user_payload):
-                return await self._send_error(detail="User not found in database", headers={"WWW-Authenticate": "Bearer"})
+            user_email = user_payload.get("sub") or user_payload.get("email")
+            # Session tokens store a UUID in `sub`; resolve it to the user's
+            # email so DB lookups and cache keys all use the canonical email.
+            if user_email and user_payload.get("token_use") == "session":  # nosec B105
+                try:
+                    import uuid as _uuid  # pylint: disable=import-outside-toplevel
+
+                    _uuid.UUID(user_email)
+                    # First-Party
+                    from mcpgateway.auth import _get_email_by_id_sync  # pylint: disable=import-outside-toplevel
+
+                    _resolved = await asyncio.to_thread(_get_email_by_id_sync, user_email)
+                    if _resolved:
+                        user_email = _resolved
+                except ValueError:
+                    pass  # Already an email string — no resolution needed
             nested_user = user_payload.get("user", {})
             nested_is_admin = nested_user.get("is_admin", False) if isinstance(nested_user, dict) else False
             is_admin = user_payload.get("is_admin", False) or nested_is_admin
