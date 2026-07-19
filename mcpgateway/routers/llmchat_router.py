@@ -958,6 +958,10 @@ async def token_streamer(chat_service: MCPChatService, message: str, user_id: st
                 content = ev.get("content", "")
                 async for part in sse("token", {"content": content}):
                     yield part
+            elif et == "reasoning":
+                content = ev.get("content", "")
+                async for part in sse("reasoning", {"content": content}):
+                    yield part
             elif et in ("tool_start", "tool_end", "tool_error"):
                 async for part in sse(et, ev):
                     yield part

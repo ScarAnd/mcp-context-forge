@@ -21,7 +21,7 @@ The module consists of several key components:
 # Standard
 from datetime import datetime, timezone
 import time
-from typing import Any, AsyncGenerator, Dict, List, Literal, Optional, Union
+from typing import Any, AsyncGenerator, Dict, List, Literal, Optional, Sequence, Union
 from uuid import uuid4
 
 # Third-Party
@@ -95,8 +95,12 @@ from mcpgateway.common.validators import SecurityValidator
 from mcpgateway.config import settings
 from mcpgateway.observability import create_span, set_span_attribute
 from mcpgateway.services.cancellation_service import cancellation_service
+from mcpgateway.services.llm_proxy_service import LLMProxyService
 from mcpgateway.services.logging_service import LoggingService
 from mcpgateway.utils.trace_redaction import is_input_capture_enabled, is_output_capture_enabled, serialize_trace_payload
+
+# First-Party
+from mcpgateway.llm_schemas import ChatCompletionRequest, ChatMessage
 
 logging_service = LoggingService()
 logger = logging_service.get_logger(__name__)
@@ -343,6 +347,28 @@ class OllamaConfig(BaseModel):
     num_ctx: Optional[int] = Field(None, gt=0, description="Context window size")
 
     model_config = {"json_schema_extra": {"example": {"base_url": "http://localhost:11434", "model": "llama2", "temperature": 0.7}}}
+
+
+class CohereConfig(BaseModel):
+    """Configuration for Cohere provider."""
+
+    api_key: str = Field(..., description="Cohere API key")
+    base_url: Optional[str] = Field("https://api.cohere.com/v2", description="Base URL for Cohere-compatible endpoints")
+    model: str = Field(default="command-r-plus", description="Cohere model name")
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0, description="Sampling temperature")
+    max_tokens: Optional[int] = Field(None, gt=0, description="Maximum tokens to generate")
+    timeout: Optional[float] = Field(None, gt=0, description="Request timeout in seconds")
+    max_retries: int = Field(default=2, ge=0, description="Maximum number of retries")
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "api_key": "your-cohere-api-key",  # pragma: allowlist secret
+                "model": "command-r-plus",
+                "temperature": 0.7,
+            }
+        }
+    }
 
 
 class OpenAIConfig(BaseModel):
@@ -627,8 +653,10 @@ class LLMConfig(BaseModel):
         'watsonx'
     """
 
-    provider: Literal["azure_openai", "openai", "anthropic", "aws_bedrock", "ollama", "watsonx", "gateway"] = Field(..., description="LLM provider type")
-    config: Union[AzureOpenAIConfig, OpenAIConfig, AnthropicConfig, AWSBedrockConfig, OllamaConfig, WatsonxConfig, GatewayConfig] = Field(..., description="Provider-specific configuration")
+    provider: Literal["azure_openai", "openai", "anthropic", "aws_bedrock", "ollama", "watsonx", "cohere", "gateway"] = Field(..., description="LLM provider type")
+    config: Union[AzureOpenAIConfig, OpenAIConfig, AnthropicConfig, AWSBedrockConfig, OllamaConfig, WatsonxConfig, CohereConfig, GatewayConfig] = Field(
+        ..., description="Provider-specific configuration"
+    )
 
     @field_validator("config", mode="before")
     @classmethod
@@ -667,6 +695,8 @@ class LLMConfig(BaseModel):
                 return OllamaConfig(**v)
             if provider == "watsonx":
                 return WatsonxConfig(**v)
+            if provider == "cohere":
+                return CohereConfig(**v)
             if provider == "gateway":
                 return GatewayConfig(**v)
 
@@ -1431,6 +1461,162 @@ class WatsonxProvider:
         return self.config.model_id
 
 
+class GatewayProxyChatModel(BaseChatModel):
+    """LangChain chat model that delegates gateway-backed requests to the internal LLM proxy."""
+
+    model_id: str
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+
+    bound_tools: Optional[List[Dict[str, Any]]] = None
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = None
+
+    @property
+    def _llm_type(self) -> str:
+        return "gateway_proxy"
+
+    def bind_tools(self, tools: Sequence[Any], *, tool_choice: Optional[Union[str, Dict[str, Any]]] = None, **kwargs: Any) -> "GatewayProxyChatModel":
+        logger.warning(
+            "GatewayProxyChatModel.bind_tools called model=%s tool_count=%s tool_choice=%s",
+            self.model_id,
+            len(tools),
+            tool_choice,
+        )
+        formatted_tools = []
+        for tool in tools:
+            name = getattr(tool, "name", None)
+            if not name and isinstance(tool, dict):
+                name = tool.get("name")
+            description = getattr(tool, "description", None)
+            if description is None and isinstance(tool, dict):
+                description = tool.get("description")
+            args_schema = getattr(tool, "args_schema", None)
+            parameters: Dict[str, Any] = {"type": "object", "properties": {}}
+            if args_schema is not None and hasattr(args_schema, "model_json_schema"):
+                parameters = args_schema.model_json_schema()
+            elif isinstance(tool, dict) and isinstance(tool.get("parameters"), dict):
+                parameters = tool["parameters"]
+
+            if not name:
+                continue
+
+            formatted_tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": description,
+                        "parameters": parameters,
+                    },
+                }
+            )
+
+        logger.warning(
+            "GatewayProxyChatModel.bind_tools prepared model=%s formatted_tool_count=%s",
+            self.model_id,
+            len(formatted_tools),
+        )
+        return self.model_copy(update={"bound_tools": formatted_tools or None, "tool_choice": tool_choice})
+
+    def _generate(self, messages: List[BaseMessage], stop: Optional[List[str]] = None, run_manager: Any = None, **kwargs: Any) -> Any:
+        raise NotImplementedError("GatewayProxyChatModel only supports async execution")
+
+    async def _agenerate(self, messages: List[BaseMessage], stop: Optional[List[str]] = None, run_manager: Any = None, **kwargs: Any) -> Any:
+        from langchain_core.messages import AIMessage
+        from langchain_core.outputs import ChatGeneration, ChatResult
+        from mcpgateway.db import SessionLocal
+
+        logger.warning(
+            "GatewayProxyChatModel._agenerate called model=%s message_count=%s bound_tool_count=%s stop=%s",
+            self.model_id,
+            len(messages),
+            len(self.bound_tools or []),
+            stop,
+        )
+        request = self._build_request(messages, stream=False, stop=stop)
+        proxy_service = LLMProxyService()
+        try:
+            await proxy_service.initialize()
+            with SessionLocal() as db:
+                proxy_response = await proxy_service.chat_completion(db, request)
+        finally:
+            await proxy_service.shutdown()
+
+        return ChatResult(
+            generations=[
+                ChatGeneration(
+                    message=AIMessage(
+                        content=proxy_response.choices[0].message.content if proxy_response.choices else "",
+                        tool_calls=proxy_response.choices[0].message.tool_calls if proxy_response.choices else None,
+                        usage_metadata={
+                            "input_tokens": proxy_response.usage.prompt_tokens,
+                            "output_tokens": proxy_response.usage.completion_tokens,
+                            "total_tokens": proxy_response.usage.total_tokens,
+                        },
+                    )
+                )
+            ]
+        )
+
+    async def _astream(self, messages: List[BaseMessage], stop: Optional[List[str]] = None, run_manager: Any = None, **kwargs: Any) -> AsyncGenerator[Any, None]:
+        from langchain_core.messages import AIMessageChunk
+        from langchain_core.outputs import ChatGenerationChunk
+        from mcpgateway.db import SessionLocal
+
+        request = self._build_request(messages, stream=True, stop=stop)
+        proxy_service = LLMProxyService()
+        try:
+            await proxy_service.initialize()
+            with SessionLocal() as db:
+                async for chunk in proxy_service.chat_completion_stream(db, request):
+                    if not chunk.startswith("data: "):
+                        continue
+                    payload = chunk[6:].strip()
+                    if payload == "[DONE]":
+                        break
+                    data = orjson.loads(payload)
+                    delta = data.get("choices", [{}])[0].get("delta", {})
+                    content = delta.get("content")
+                    reasoning = delta.get("reasoning")
+                    if content or reasoning:
+                        message_chunk = AIMessageChunk(content=content or "")
+                        if reasoning:
+                            message_chunk.additional_kwargs["reasoning"] = reasoning
+                        yield ChatGenerationChunk(message=message_chunk)
+        finally:
+            await proxy_service.shutdown()
+
+    def _build_request(self, messages: List[BaseMessage], stream: bool, stop: Optional[List[str]] = None) -> ChatCompletionRequest:
+        from langchain_core.messages import AIMessage, ToolMessage
+
+        request_messages = []
+        for message in messages:
+            role = "user"
+            tool_calls = None
+            tool_call_id = None
+            if isinstance(message, AIMessage):
+                role = "assistant"
+                tool_calls = getattr(message, "tool_calls", None)
+            elif isinstance(message, ToolMessage):
+                role = "tool"
+                tool_call_id = getattr(message, "tool_call_id", None)
+            elif getattr(message, "type", None) == "system":
+                role = "system"
+            request_messages.append(ChatMessage(role=role, content=message.content, tool_calls=tool_calls, tool_call_id=tool_call_id))
+
+        request = ChatCompletionRequest(
+            model=self.model_id,
+            messages=request_messages,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            stream=stream,
+            tools=self.bound_tools,
+            tool_choice=self.tool_choice,
+            stop=stop,
+        )
+        return request
+
+
 class GatewayProvider:
     """
     Gateway provider implementation for using models configured in LLM Settings.
@@ -1545,6 +1731,15 @@ class GatewayProvider:
             # Create appropriate LLM based on provider type
             provider_type = provider.provider_type.lower()
             config = decrypt_provider_config_for_runtime(provider.config)
+            logger.warning(
+                "GatewayProvider resolved model=%s provider_id=%s provider_name=%s provider_type=%s api_base=%s model_type=%s",
+                model.model_id,
+                provider.id,
+                provider.name,
+                provider_type,
+                provider.api_base,
+                model_type,
+            )
 
             # Common kwargs
             kwargs: Dict[str, Any] = {
@@ -1717,6 +1912,14 @@ class GatewayProvider:
                         params=params,
                     )
 
+            elif provider_type in {"cohere"}:  # Add more (mistral, groq, together) in case implemented
+                self.llm = GatewayProxyChatModel(
+                    model_id=model.model_id,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    timeout=self.config.timeout,
+                )
+
             elif provider_type == "openai_compatible":
                 if not provider.api_base:
                     raise ValueError("OpenAI-compatible provider requires base_url to be configured")
@@ -1835,6 +2038,7 @@ class LLMProviderFactory:
             "aws_bedrock": AWSBedrockProvider,
             "ollama": OllamaProvider,
             "watsonx": WatsonxProvider,
+            "cohere": OpenAIProvider,
             "gateway": GatewayProvider,
         }
 
@@ -2903,6 +3107,13 @@ class MCPChatService:
                         elif kind == "on_chat_model_stream":
                             chunk = event.get("data", {}).get("chunk")
                             if chunk and hasattr(chunk, "content"):
+                                reasoning = None
+                                additional_kwargs = getattr(chunk, "additional_kwargs", None)
+                                if isinstance(additional_kwargs, dict):
+                                    reasoning = additional_kwargs.get("reasoning")
+                                if reasoning:
+                                    yield {"type": "reasoning", "content": reasoning}
+
                                 content = chunk.content
                                 if content:
                                     full_response += content

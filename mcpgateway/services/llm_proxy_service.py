@@ -320,6 +320,41 @@ class LLMProxyService:
 
         return url, headers, body
 
+    def _build_cohere_request(self, request: ChatCompletionRequest, provider: LLMProvider, model: LLMModel):
+        """"""
+        api_key = self._get_api_key(provider)
+        base_url = provider.api_base or "https://api.cohere.com/v2"
+
+        url = f"{base_url.rstrip('/')}/chat"
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        messages = []
+        for msg in request.messages:
+            messages.append({"role": msg.role, "content": msg.content})
+
+        body: Dict[str, Any] = {
+            "model": model.model_id,
+            "messages": messages,
+            "max_tokens": request.max_tokens or provider.default_max_tokens or 4096,
+        }
+
+        if request.temperature is not None:
+            body["temperature"] = request.temperature
+        elif provider.default_temperature:
+            body["temperature"] = provider.default_temperature
+
+        if request.tools:
+            body["tools"] = [t.model_dump() for t in request.tools]
+
+        if request.stream:
+            body["stream"] = True
+
+        return url, headers, body
+
     def _build_anthropic_request(
         self,
         request: ChatCompletionRequest,
@@ -469,6 +504,8 @@ class LLMProxyService:
             url, headers, body = self._build_anthropic_request(request, provider, model)
         elif provider.provider_type == LLMProviderType.OLLAMA:
             url, headers, body = self._build_ollama_request(request, provider, model)
+        elif provider.provider_type == LLMProviderType.COHERE:
+            url, headers, body = self._build_cohere_request(request, provider, model)
         else:
             # Default to OpenAI-compatible
             url, headers, body = self._build_openai_request(request, provider, model)
@@ -502,6 +539,8 @@ class LLMProxyService:
                 # Transform response based on provider
                 if provider.provider_type == LLMProviderType.ANTHROPIC:
                     result = self._transform_anthropic_response(data, model.model_id)
+                elif provider.provider_type == LLMProviderType.COHERE:
+                    result = self._transform_cohere_response(data, model.model_id)
                 elif provider.provider_type == LLMProviderType.OLLAMA:
                     base_url = (provider.api_base or "").rstrip("/")
                     if base_url.endswith("/v1"):
@@ -556,6 +595,8 @@ class LLMProxyService:
             url, headers, body = self._build_anthropic_request(request, provider, model)
         elif provider.provider_type == LLMProviderType.OLLAMA:
             url, headers, body = self._build_ollama_request(request, provider, model)
+        elif provider.provider_type == LLMProviderType.COHERE:
+            url, headers, body = self._build_cohere_request(request, provider, model)
         else:
             url, headers, body = self._build_openai_request(request, provider, model)
 
@@ -608,6 +649,8 @@ class LLMProxyService:
 
                                 if provider.provider_type == LLMProviderType.ANTHROPIC:
                                     chunk = self._transform_anthropic_stream_chunk(data, response_id, created, model.model_id)
+                                elif provider.provider_type == LLMProviderType.COHERE:
+                                    chunk = self._transform_cohere_stream_chunk(data, response_id, created, model.model_id)
                                 elif provider.provider_type == LLMProviderType.OLLAMA:
                                     base_url = (provider.api_base or "").rstrip("/")
                                     if base_url.endswith("/v1"):
@@ -696,6 +739,42 @@ class LLMProxyService:
             usage=usage,
         )
 
+    def _transform_cohere_response(self, data: Dict[str, Any], model_id: str) -> ChatCompletionResponse:
+        """Transform Cohere response to OpenAI format.
+
+        Args:
+            data: Raw Cohere API response data.
+            model_id: Model ID to include in response.
+
+        Returns:
+            ChatCompletionResponse in OpenAI format.
+        """
+        content = ""
+        message = data.get("message", {})
+        for chunk in message.get("content", []):
+            if chunk.get("type") == "text":
+                content += chunk.get("text", "")
+
+        usage_data = data.get("usage", {})
+
+        return ChatCompletionResponse(
+            id=data.get("id", f"chatcmpl-{uuid.uuid4().hex[:24]}"),
+            created=int(time.time()),
+            model=model_id,
+            choices=[
+                ChatChoice(
+                    index=0,
+                    message=ChatMessage(role="assistant", content=content),
+                    finish_reason="stop" if data.get("finish_reason") == "COMPLETE" else None,
+                )
+            ],
+            usage=UsageStats(
+                prompt_tokens=usage_data.get("tokens", {}).get("input_tokens", 0),
+                completion_tokens=usage_data.get("tokens", {}).get("output_tokens", 0),
+                total_tokens=usage_data.get("tokens", {}).get("input_tokens", 0) + usage_data.get("tokens", {}).get("output_tokens", 0),
+            ),
+        )
+
     def _transform_anthropic_response(
         self,
         data: Dict[str, Any],
@@ -771,6 +850,70 @@ class LLMProxyService:
                 total_tokens=data.get("prompt_eval_count", 0) + data.get("eval_count", 0),
             ),
         )
+
+    def _transform_cohere_stream_chunk(
+        self,
+        data: Dict[str, Any],
+        response_id: str,
+        created: int,
+        model_id: str,
+    ) -> Optional[str]:
+        """Transform Cohere streaming chunk to OpenAI format.
+
+        Args:
+            data: Raw Ollama streaming event data.
+            response_id: Response ID for the chunk.
+            created: Timestamp for the response.
+            model_id: Model ID to include in response.
+
+        Returns:
+            JSON string chunk in OpenAI format, or None if not applicable.
+        """
+        event_type = data.get("type")
+
+        logger.info(f"ANDRIN: {data}")
+
+        if event_type == "content-delta":
+            delta = data.get("delta", {})
+            content_delta = delta.get("message", {}).get("content", {})
+            message = content_delta.get("text", "")
+            reasoning = content_delta.get("thinking", "")
+
+            if not message and not reasoning:
+                return None
+
+            chunk_delta: Dict[str, Any] = {}
+            if message:
+                chunk_delta["content"] = message
+            if reasoning:
+                chunk_delta["reasoning"] = reasoning
+
+            chunk = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_id,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": chunk_delta,
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            return orjson.dumps(chunk).decode()
+
+        elif event_type == "message-end":
+            chunk = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_id,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+            return orjson.dumps(chunk).decode()
+
+        return None
 
     def _transform_anthropic_stream_chunk(
         self,
