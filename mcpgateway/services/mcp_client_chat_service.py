@@ -1578,10 +1578,13 @@ class GatewayProxyChatModel(BaseChatModel):
                     delta = data.get("choices", [{}])[0].get("delta", {})
                     content = delta.get("content")
                     reasoning = delta.get("reasoning")
-                    if content or reasoning:
+                    tool_calls = delta.get("tool_calls")
+                    if content or reasoning or tool_calls:
                         message_chunk = AIMessageChunk(content=content or "")
                         if reasoning:
                             message_chunk.additional_kwargs["reasoning"] = reasoning
+                        if tool_calls:
+                            message_chunk.additional_kwargs["tool_calls"] = tool_calls
                         yield ChatGenerationChunk(message=message_chunk)
         finally:
             await proxy_service.shutdown()

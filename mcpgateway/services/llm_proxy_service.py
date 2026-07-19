@@ -913,6 +913,42 @@ class LLMProxyService:
             }
             return orjson.dumps(chunk).decode()
 
+        elif event_type == "tool-call-start":
+            tool_call = data.get("delta", {}).get("message", {}).get("tool_calls", {})
+            tool_call_id = tool_call.get("id")
+            function_data = tool_call.get("function", {})
+            tool_name = function_data.get("name")
+            tool_arguments = function_data.get("arguments", "")
+            if not tool_call_id or not tool_name:
+                return None
+
+            chunk = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_id,
+                "choices": [
+                    {
+                        "index": data.get("index", 0),
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": data.get("index", 0),
+                                    "id": tool_call_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tool_name,
+                                        "arguments": tool_arguments,
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            return orjson.dumps(chunk).decode()
+
         return None
 
     def _transform_anthropic_stream_chunk(
