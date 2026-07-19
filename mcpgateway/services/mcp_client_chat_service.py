@@ -1870,6 +1870,7 @@ class GatewayProvider:
                     "model": model.model_id,
                     "temperature": temperature,
                     "timeout": self.config.timeout,
+                    "reasoning": True,
                 }
                 if num_ctx:
                     ollama_kwargs["num_ctx"] = num_ctx
@@ -3113,7 +3114,7 @@ class MCPChatService:
                                 reasoning = None
                                 additional_kwargs = getattr(chunk, "additional_kwargs", None)
                                 if isinstance(additional_kwargs, dict):
-                                    reasoning = additional_kwargs.get("reasoning")
+                                    reasoning = additional_kwargs.get("reasoning_content") or additional_kwargs.get("reasoning")
                                 if reasoning:
                                     yield {"type": "reasoning", "content": reasoning}
 

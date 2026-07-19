@@ -871,8 +871,6 @@ class LLMProxyService:
         """
         event_type = data.get("type")
 
-        logger.info(f"ANDRIN: {data}")
-
         if event_type == "content-delta":
             delta = data.get("delta", {})
             content_delta = delta.get("message", {}).get("content", {})
