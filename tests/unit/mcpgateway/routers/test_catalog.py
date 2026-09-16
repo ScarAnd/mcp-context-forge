@@ -18,6 +18,7 @@ import pytest
 from mcpgateway.api.v1 import build_legacy_router, build_v1_router
 from mcpgateway.config import settings
 from mcpgateway.routers.catalog import list_catalog_servers, register_catalog_server
+from mcpgateway.services.catalog_service import CatalogRegistrationPermissionError
 from mcpgateway.schemas import CatalogListResponse, CatalogServerRegisterBody, CatalogServerRegisterRequest, CatalogServerRegisterResponse
 from mcpgateway.services.catalog_service import CATALOG_REGISTER_ALREADY_REGISTERED_MSG, CATALOG_REGISTER_NOT_FOUND_MSG
 from tests.helpers.router_helpers import collect_routes
@@ -227,7 +228,7 @@ async def test_register_open_one_click_no_body(monkeypatch, allow_permission):
         "db": db,
         "created_by": "user@example.com",
         "owner_email": "user@example.com",
-        "team_id": None,
+        "token_teams": [],
     }
 
 
@@ -254,6 +255,32 @@ async def test_register_with_api_key_builds_request(monkeypatch, allow_permissio
     assert service_request.server_id == "asana"
     assert service_request.name == "Custom"
     assert service_request.api_key == "sk-123"
+
+
+@pytest.mark.asyncio
+async def test_register_with_oauth_credentials_builds_request(monkeypatch, allow_permission):
+    """oauth_credentials on the body reach the service request in the same single call
+    (#5967) - no separate PUT /gateways/{id} for OAuth configuration."""
+    monkeypatch.setattr("mcpgateway.routers.catalog.settings.mcpgateway_catalog_enabled", True, raising=False)
+    monkeypatch.setattr("mcpgateway.routers.catalog.get_scoped_resource_access_context", MagicMock(return_value=("user@example.com", [])))
+    mock_register = AsyncMock(return_value=CatalogServerRegisterResponse(success=True, server_id="gw-1", message="Successfully registered OAuth server", error=None, oauth_required=True))
+    monkeypatch.setattr("mcpgateway.routers.catalog.catalog_service.register_catalog_server", mock_register)
+    db = MagicMock()
+    request = MagicMock(spec=Request)
+    oauth_credentials = {"issuer": "https://issuer.example.com", "scopes": ["read"]}
+
+    await register_catalog_server(
+        "github",
+        request,
+        body=CatalogServerRegisterBody(oauth_credentials=oauth_credentials),
+        db=db,
+        user={"email": "user@example.com", "db": db},
+    )
+
+    service_request = mock_register.await_args.kwargs["request"]
+    assert isinstance(service_request, CatalogServerRegisterRequest)
+    assert service_request.server_id == "github"
+    assert service_request.oauth_credentials == oauth_credentials
 
 
 @pytest.mark.asyncio
@@ -338,7 +365,7 @@ async def test_register_forwards_identity_and_team(monkeypatch, allow_permission
     kwargs = mock_register.await_args.kwargs
     assert kwargs["created_by"] == "user@example.com"
     assert kwargs["owner_email"] == "user@example.com"
-    assert kwargs["team_id"] == "team-a"
+    assert kwargs["token_teams"] == ["team-a"]
 
 
 @pytest.mark.asyncio
@@ -356,7 +383,7 @@ async def test_register_public_only_token_gets_no_team(monkeypatch, allow_permis
 
     kwargs = mock_register.await_args.kwargs
     assert kwargs["owner_email"] == "user@example.com"
-    assert kwargs["team_id"] is None
+    assert kwargs["token_teams"] == []
 
 
 def test_register_body_rejects_unsafe_name():
@@ -371,9 +398,63 @@ def test_register_body_rejects_oversized_api_key():
         CatalogServerRegisterBody(api_key="x" * 5000)  # pragma: allowlist secret
 
 
+def test_register_body_rejects_oversized_oauth_credentials():
+    """oauth_credentials string values are capped the same way api_key is, so a caller can't
+    smuggle a multi-megabyte client_secret past validation."""
+    with pytest.raises(pydantic.ValidationError):
+        CatalogServerRegisterBody(oauth_credentials={"client_secret": "x" * 5000})  # pragma: allowlist secret
+
+
+def test_register_body_allows_reasonably_sized_oauth_credentials():
+    """Normal-sized oauth_credentials values pass through unchanged."""
+    body = CatalogServerRegisterBody(oauth_credentials={"issuer": "https://issuer.example.com", "scopes": ["repo"]})
+
+    assert body.oauth_credentials == {"issuer": "https://issuer.example.com", "scopes": ["repo"]}
+
+
+def test_register_body_rejects_oversized_nested_oauth_credentials():
+    """A nested container walks straight past a top-level-only `isinstance(value, str)` length
+    check, since the check simply skips non-string values. A large payload smuggled inside a
+    nested list must still be rejected on serialized size, not silently accepted."""
+    with pytest.raises(pydantic.ValidationError):
+        CatalogServerRegisterBody(oauth_credentials={"client_secret": ["A" * 4096] * 5000})  # pragma: allowlist secret
+
+
+def test_register_body_rejects_deeply_nested_oauth_credentials():
+    """oauth_credentials is a flat dict of scalars/short lists; deeper nesting than that has no
+    legitimate use and is rejected outright."""
+    with pytest.raises(pydantic.ValidationError):
+        CatalogServerRegisterBody(oauth_credentials={"issuer": {"nested": {"too": "deep"}}})
+
+
+def test_register_request_also_caps_oauth_credentials():
+    """CatalogServerRegisterRequest backs `POST /admin/mcp-registry/{server_id}/register`
+    (mcpgateway/admin.py) as well as the internally-constructed request the v1 router builds
+    from CatalogServerRegisterBody. Both entry points into oauth_credentials must carry the same
+    bound - without this, the admin endpoint was the uncapped one."""
+    with pytest.raises(pydantic.ValidationError):
+        CatalogServerRegisterRequest(server_id="oauth-server", oauth_credentials={"client_secret": "x" * 5000})  # pragma: allowlist secret
+
+
 def test_register_body_allows_empty_payload():
     """Both overrides are optional."""
     body = CatalogServerRegisterBody()
 
     assert body.name is None
     assert body.api_key is None
+
+
+@pytest.mark.asyncio
+async def test_register_permission_error_returns_403(monkeypatch, allow_permission):
+    """A CatalogRegistrationPermissionError maps to HTTP 403."""
+    monkeypatch.setattr("mcpgateway.routers.catalog.settings.mcpgateway_catalog_enabled", True, raising=False)
+    monkeypatch.setattr("mcpgateway.routers.catalog.get_scoped_resource_access_context", MagicMock(return_value=("user@example.com", [])))
+    monkeypatch.setattr("mcpgateway.routers.catalog.catalog_service.register_catalog_server", AsyncMock(side_effect=CatalogRegistrationPermissionError("denied")))
+    db = MagicMock()
+    request = MagicMock(spec=Request)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await register_catalog_server("asana", request, db=db, user={"email": "user@example.com", "db": db})
+
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.detail == "denied"

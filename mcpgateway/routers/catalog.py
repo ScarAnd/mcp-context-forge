@@ -19,7 +19,7 @@ from mcpgateway.config import settings
 from mcpgateway.db import get_db
 from mcpgateway.middleware.rbac import get_current_user_with_permissions, require_permission
 from mcpgateway.schemas import CatalogListRequest, CatalogListResponse, CatalogServerRegisterBody, CatalogServerRegisterRequest, CatalogServerRegisterResponse
-from mcpgateway.services.catalog_service import CATALOG_REGISTER_ALREADY_REGISTERED_MSG, CATALOG_REGISTER_NOT_FOUND_MSG, catalog_service
+from mcpgateway.services.catalog_service import CATALOG_REGISTER_ALREADY_REGISTERED_MSG, CATALOG_REGISTER_NOT_FOUND_MSG, CatalogRegistrationPermissionError, catalog_service
 
 router = APIRouter(prefix="/catalog", tags=["Catalog"])
 
@@ -104,7 +104,7 @@ async def register_catalog_server(
     Args:
         catalog_id: Catalog server ID to register.
         request: FastAPI request object.
-        body: Optional overrides (custom name, API key).
+        body: Optional overrides (custom name, API key, OAuth credentials).
         db: Database session.
         user: Authenticated user.
 
@@ -118,20 +118,33 @@ async def register_catalog_server(
     if not settings.mcpgateway_catalog_enabled:
         raise HTTPException(status_code=404, detail="Catalog feature is disabled")
 
-    service_request = CatalogServerRegisterRequest(server_id=catalog_id, name=body.name, api_key=body.api_key) if body else None
+    # Map body fields (including visibility/team_id) into the service request
+    service_request = (
+        CatalogServerRegisterRequest(
+            server_id=catalog_id,
+            name=body.name if body else None,
+            api_key=body.api_key if body else None,
+            oauth_credentials=body.oauth_credentials if body else None,
+            visibility=body.visibility if body else None,
+            team_id=body.team_id if body else None,
+        )
+        if body
+        else None
+    )
 
     user_email, token_teams = get_scoped_resource_access_context(request, user)
-    is_public_only_token = token_teams is not None and len(token_teams) == 0
-    team_id = None if is_public_only_token else getattr(request.state, "team_id", None)
 
-    result = await catalog_service.register_catalog_server(
-        catalog_id=catalog_id,
-        request=service_request,
-        db=db,
-        created_by=user_email,
-        owner_email=user_email,
-        team_id=team_id,
-    )
+    try:
+        result = await catalog_service.register_catalog_server(
+            catalog_id=catalog_id,
+            request=service_request,
+            db=db,
+            created_by=user_email,
+            owner_email=user_email,
+            token_teams=token_teams,
+        )
+    except CatalogRegistrationPermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
     if not result.success:
         if result.message == CATALOG_REGISTER_NOT_FOUND_MSG:
