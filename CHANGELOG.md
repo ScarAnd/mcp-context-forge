@@ -8,6 +8,20 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- **Completion authorization** ([#6760](https://github.com/IBM/mcp-context-forge/pull/6760)) - `POST /protocol/completion/complete` now requires `tools.read` RBAC permission. Previously, authentication alone passed this endpoint's authorization check. Before upgrading from 1.0.11, grant `tools.read` to completion callers' roles and include it in replacement tokens with explicit permission scopes. Denied callers receive HTTP 403 before upstream access. See [completion permission migration](docs/docs/manage/api-usage.md#completion-compatibility-and-permission-migration).
+
+### Added
+
+- **Named response models for A2A routes** ([#6820](https://github.com/IBM/mcp-context-forge/pull/6820), [#6699](https://github.com/IBM/mcp-context-forge/issues/6699)) - Added named response models for `POST /v1/a2a/{agent_name}/invoke`, `POST /v1/a2a/invoke`, and `POST /v1/a2a/{agent_name}/jsonrpc`. The OpenAPI schema now exposes typed components while preserving the routes' passthrough behavior.
+
+- **Federated completions** ([#6629](https://github.com/IBM/mcp-context-forge/issues/6629)) - Forward `completion/complete` to the owning upstream with request metadata. Both legacy and modern MCP connections remain supported through existing negotiation settings; forwarding has no modern-only gate.
+
+- **`make testing-up` web UI URL** - The startup summary now shows a `ContextForge Web UI` row whose port comes from the resolved Compose configuration. The printed URL now matches the port Compose publishes when `WEB_UI_PORT` is set only in `.env`. Resolution failure stops the target instead of printing a fallback URL.
+
+- **JWT lifecycle clarification after database reset** - Local JWTs remain cryptographically valid when database storage is lost but the signing key remains unchanged. Database cleanup is not credential rotation. Destructive resets must rotate `JWT_SECRET_KEY` when old-token invalidation is required. Persistent database storage and short-lived local tokens remain recommended for production deployments.
+
 - **Federated gateway tool-name collisions** - Gateway registration, refresh, OAuth discovery, reactivation, rename, and visibility updates now reject detected tool-name collisions in public, team, and private visibility scopes. Gateway automation must handle the endpoint's conflict response when a previously accepted colliding registration is rejected. Existing duplicate rows require administrator review before affected invocation names are usable. Operators can identify duplicates with:
 
   ```sql
@@ -15,6 +29,27 @@
   SELECT team_id, name, COUNT(*) AS duplicate_count FROM tools WHERE visibility = 'team' GROUP BY team_id, name HAVING COUNT(*) > 1 ORDER BY team_id, name;
   SELECT owner_email, name, COUNT(*) AS duplicate_count FROM tools WHERE visibility = 'private' GROUP BY owner_email, name HAVING COUNT(*) > 1 ORDER BY owner_email, name;
   ```
+
+- **Modern MCP protocol negotiation is on by default** - `MCP_CLIENT_CONNECT_MODE` and `MCP_INBOUND_PROTOCOL_MODE` now default to `auto` instead of `legacy`. Outbound upstream connections probe `server/discover` and negotiate the 2026-07-28 revision, with transparent fallback to the legacy `initialize` handshake. Inbound clients may send `mcp-protocol-version: 2026-07-28` instead of receiving a 400. Set either variable to `legacy` to restore the previous behaviour.
+- **`mcp-servers/` directory removed** - The unsupported sample/test MCP servers, the Go/Python scaffolding templates, and the `mcp-url-to-markdown-tests` workflow leave the repository. The six Python servers now live in [IBM/contextforge-examples](https://github.com/IBM/contextforge-examples) under `mcp-servers/python/`; the scaffolding templates are deleted without migration. The performance compose generator and benchmark docs now use the published `ghcr.io/ibm/cfex-mcp-fast-time-server` and `ghcr.io/ibm/cfex-mcp-benchmark-server` images. The `/v1/mcp-servers` REST API is unchanged: it remains the product-language alias for the gateways API.
+
+### Security
+
+- **Configuration import ownership enforcement** - `POST /v1/import` with `conflict_strategy=update` no longer overwrites tools, resources, prompts, or gateways that the importer does not own. Bulk registration now runs `check_resource_ownership()` before it modifies an existing row and reports `Permission denied` for rows the caller does not own. Bulk update without a caller identity changes nothing. The import call to `update_gateway()` now passes the importer identity. The `admin.import` routes use `global_only=True`, so a team-scoped role no longer satisfies them. The Admin UI import now passes the authenticated email as `imported_by`. Deployments that grant `admin.import` through a team-scoped role must move that grant to a global role.
+
+- **MCP Origin/Host enforcement** ([#6875](https://github.com/IBM/mcp-context-forge/pull/6875)) - Implements MCP 2025-11-25 §transport-security: a present-but-unlisted `Origin` header on `/mcp` is now rejected with HTTP 403. Set `MCP_ALLOWED_ORIGINS` to a comma-separated list of allowed origins to enable enforcement (default: empty, backward-compatible). An optional companion setting `MCP_ALLOWED_HOSTS` enforces exact `host:port` matching on the `Host` header. Enforcement runs at the public `/mcp` mount via `MCPOriginHostGate`, covering all ingress modes (Python, rust-internal, rust-public). The `/_internal/mcp/transport` bridge (trusted Rust sidecar traffic) is intentionally exempt.
+
+### Fixed
+
+- **A2A plugin header trust** - A2A pre-invoke plugins can supply credentials and custom headers without the agent caller-header allowlist. Plugin output now overrides configured agent authentication, and an empty `Authorization` value suppresses all fallback authorization. The gateway retains inbound caller filtering, sanitizes plugin input, resolves output case-insensitively, and strips `X-Vault-Tokens` before egress.
+
+- **Frontend email routes** - Invitation and password emails include the React `/app` mount prefix. `UI_BASE_URL` accepts a deployment base or a full frontend root ending in `/app`. Full roots produce a startup warning and have only the final mount segment removed during normalization. For a deployment prefix `/contextforge/app`, set the full root `https://ui.example.com/contextforge/app/app` to preserve both segments in emailed links. The invitation frontend route remains tracked by #6776.
+
+- **Modern MCP clients no longer see the deprecated logging capability** ([#6630](https://github.com/IBM/mcp-context-forge/issues/6630), [#6631](https://github.com/IBM/mcp-context-forge/issues/6631)) - `server/discover` responses for `2026-07-28` clients now omit `capabilities.logging`. MCP 2026-07-28 deprecates that capability (SEP-2577), and ContextForge sends no request-scoped log messages. Clients on `2025-11-25` and older still receive the capability and can call `logging/setLevel`. Use OpenTelemetry and structured logging for gateway observability. Modern clients reach the gateway only when `MCP_INBOUND_PROTOCOL_MODE=auto`; `docker-compose.yml` now passes that variable to the gateway, with a `legacy` default.
+
+### Breaking Changes
+
+- **Experimental anyio cancellation monkey-patch removed** ([#5427](https://github.com/IBM/mcp-context-forge/pull/5427)) - Removed the opt-in `ANYIO_CANCEL_DELIVERY_PATCH_ENABLED` and `ANYIO_CANCEL_DELIVERY_MAX_ITERATIONS` workaround from `mcpgateway/transports/sse_transport.py`, together with the `SSE_TASK_GROUP_CLEANUP_TIMEOUT` setting. The gateway now requires `anyio>=4.15.0`, which fixes the `_deliver_cancellation` CPU spin loop upstream (anyio issues [#695](https://github.com/agronholm/anyio/issues/695) and [#1111](https://github.com/agronholm/anyio/issues/1111)). Unknown environment keys are ignored, so existing deployments start without changes. Remove the retired variables from your configuration to keep it accurate. The matching Helm values and docker-compose entries are also removed. Dangling `MCP_SESSION_POOL_CLEANUP_TIMEOUT` references, which no code path ever read, are removed from docker-compose, the Helm chart, and `.env.example`. SSE connection protection and cleanup timeouts remain the containment strategy; see [`docs/docs/operations/cpu-spin-loop-mitigation.md`](docs/docs/operations/cpu-spin-loop-mitigation.md).
 
 ## [1.0.11] - 2026-09-28 - MCP Python SDK 2.x, Tool Preview, SSO Controls, and Live E2E Coverage
 
@@ -39,6 +74,8 @@ Release 1.0.11 consolidates **57 PRs** focused on **the MCP Python SDK 2.x migra
 
 #### **Security & Auth**
 
+- **`private_key_jwt` token endpoint client authentication** ([#6988](https://github.com/IBM/mcp-context-forge/issues/6988)) - `oauth_config.token_endpoint_auth_method` now supports RFC 7523 `private_key_jwt`. Token requests on the client-credentials, authorization-code, refresh, and password flows include `client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer` and a signed `client_assertion` carrying `iss`, `sub`, `aud`, `iat`, `exp`, `jti`, and an optional `kid`. Configuration is validated at the API boundary, and an unknown method now fails closed instead of silently falling back to `client_secret_post`. Supported signing algorithms are asymmetric only (`RS256`, `RS384`, `RS512`, `ES256`, `ES384`, `ES512`, `PS256`); `token_endpoint_auth_signing_alg` and `private_key_jwt_kid` are optional. Signing keys are validated before persistence and again before signing: the effective key is resolved first, so a masked placeholder is checked against the key it preserves and stored ciphertext is decrypted rather than skipped, and RSA keys must be at least 2048 bits (RFC 7518 Sections 3.3 and 3.5). An absent, null, empty, or whitespace-only `token_endpoint_auth_method` keeps the historical `client_secret_post` default at every boundary.
+
 - **Passwordless SSO-only users** ([#6603](https://github.com/IBM/mcp-context-forge/pull/6603)) - Users provisioned through SSO exist without a local password instead of carrying an unusable placeholder credential.
 - **`SSO_ALLOW_PROVIDER_LINKING`** ([#6616](https://github.com/IBM/mcp-context-forge/pull/6616)) - Explicit, fail-closed setting (default `false`) that gates cross-provider sign-in for an already-linked email.
 
@@ -54,6 +91,46 @@ Release 1.0.11 consolidates **57 PRs** focused on **the MCP Python SDK 2.x migra
 - **`invoke_tool` now enforces input-schema validation** ([#6443](https://github.com/IBM/mcp-context-forge/pull/6443)) - Live tool invocation (`tools/call`) now validates `arguments` against the tool's `input_schema` before dispatch, raising `ToolInvocationError` on a mismatch, via the same `_validate_tool_input_arguments` check `POST /tools/preview/{name}` uses (#5629). Previously `invoke_tool` never checked `arguments` against `input_schema` at all, so a tool whose callers relied on that gap will now reject calls it previously accepted. To find affected callers before enabling, preview the same arguments against `POST /tools/preview/{name}`: a `validated: false` response with an `invalid_arguments` warning is exactly what live invocation will now reject. Remediate by correcting the caller's arguments or by relaxing the tool's published `input_schema` to match what it actually accepts.
 - **Tool execution failures return MCP-compliant errors** ([#6181](https://github.com/IBM/mcp-context-forge/pull/6181)) - A failed tool execution returns a protocol-conformant error result instead of the previous ad-hoc shape. Clients that parsed the old payload must read the MCP error fields.
 - **MCP Python SDK 2.x** ([#6868](https://github.com/IBM/mcp-context-forge/pull/6868)) - The gateway now requires `mcp>=2.0.0`, `mcp-types>=2.0.0`, and `cpex>=0.1.4`, the first CPEX release built for `mcp` 2.x. Python consumers that import the gateway next to `mcp` 1.x must upgrade. Protocol behaviour is unchanged by default: `MCP_CLIENT_CONNECT_MODE` and `MCP_INBOUND_PROTOCOL_MODE` both default to `legacy`, and `GATEWAY_MODERN_LISTENERS_ENABLED` defaults to `false`. Set them to `auto` and `true` to negotiate the 2026-07-28 revision.
+
+### Security
+
+- JSON Schema validation now runs in a killable worker process whenever the schema carries a
+  `pattern` or `patternProperties` keyword. A catastrophic regex in a tool or prompt schema
+  can no longer stall a gateway worker. Registration is unchanged: a schema carrying such a
+  pattern is still accepted, and an operator warning names it.
+
+- **Outbound connection hardening** - Outbound HTTP requests now establish connections against an
+  address that the outbound URL policy validated, while preserving the original hostname for the
+  `Host` header and for TLS certificate verification. No configuration change is required.
+
+  Operators should note the following behavior changes:
+
+  - Outbound URL validation now runs even when `SSRF_PROTECTION_ENABLED=false`. The scheme allowlist,
+    dangerous-protocol, control-character, embedded-credential and XSS checks in `SecurityValidator`
+    apply unconditionally. Disabling SSRF protection previously disabled these unrelated checks as a
+    side effect; it no longer does. A deployment that relied on that side effect to reach a
+    non-HTTP(S) URL will now see it rejected.
+  - Pooled upstream MCP sessions no longer follow HTTP redirects. An upstream that answers `/sse`
+    with a 307 redirect to `/sse/` now fails instead of following it. Register the redirected URL
+    directly if you rely on that behavior.
+  - Connection setup fails closed when a caller-supplied HTTP client's TLS context cannot be read,
+    rather than continuing with default trust material. Under `SKIP_SSL_VERIFY=true` the previous
+    fallback would have meant no certificate verification at all.
+  - Some outbound requests now connect to a single validated address instead of retrying every
+    address returned by DNS. A dual-stack upstream whose first-sorted address is unreachable may now
+    fail where a plain resolution previously fell through to the next address.
+  - Requests that connect to a validated address now use a dedicated connection rather than a shared
+    pool, so two destinations that resolve to the same address can no longer share a connection whose
+    certificate was verified for only one of them.
+  - Connection handling is unchanged when an environment proxy (`HTTP_PROXY`, `HTTPS_PROXY`,
+    `ALL_PROXY`) applies to the target, since the proxy performs name resolution.
+
+
+### Deprecated
+
+- **gRPC upstream services** - Deprecated as of 2026-10-20 and sunsets on 2027-01-18. Registering gRPC services as upstreams (`MCPGATEWAY_GRPC_ENABLED`, the gRPC admin routes, and the `grpc` install extra) has no replacement and stops working at the sunset date. See [Deprecations](docs/docs/deprecations.md).
+- **WebSocket upstreams** - Deprecated as of 2026-10-20 and sunsets on 2027-01-18. Gateway and catalog registrations with `ws://` or `wss://` URLs or `transport=WEBSOCKET` must move to Streamable HTTP or SSE. The gateway's client-facing WebSocket endpoint is not affected. See [Deprecations](docs/docs/deprecations.md).
+- **Local observability data store** - Deprecated as of 2026-10-20 and sunsets on 2027-01-18. The internal trace, span, and metric tables and the Admin UI views that read them are replaced by OTel export (`OTEL_ENABLE_OBSERVABILITY=true`, `OTEL_EXPORTER_OTLP_ENDPOINT`). See [Deprecations](docs/docs/deprecations.md).
 
 ### Fixed
 

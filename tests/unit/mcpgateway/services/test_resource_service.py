@@ -15,22 +15,27 @@ This suite provides complete test coverage for:
 """
 
 # Standard
-from datetime import datetime, timezone
 import base64
+from datetime import datetime, timezone
 import logging
 import mimetypes
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 # Third-Party
 import pytest
+from sqlalchemy import create_engine
 from sqlalchemy.exc import IntegrityError, MultipleResultsFound
+from sqlalchemy.orm import Session
 
 # First-Party
+from mcpgateway.db import Base, EmailUser
 from mcpgateway.db import Resource as DbResource
 from mcpgateway.schemas import ResourceCreate, ResourceRead, ResourceSubscription, ResourceUpdate
 from mcpgateway.services.mcp_apps import MCP_UI_EXTENSION
 from mcpgateway.services.resource_service import ResourceError, ResourceNotFoundError, ResourceService, ResourceURIConflictError, ResourceValidationError
+from mcpgateway.services.resource_service import upstream_read_cache_var
 
 # Local
 from tests.helpers.admin_mocks import install_admin_user
@@ -3573,12 +3578,14 @@ class TestResourceBulkRegistration:
             )
         ]
 
-        result = await resource_service.register_resources_bulk(
-            db=mock_db,
-            resources=resources,
-            created_by="tester",
-            conflict_strategy="update",
-        )
+        with patch("mcpgateway.services.permission_service.PermissionService.check_resource_ownership", new=AsyncMock(return_value=True)):
+            result = await resource_service.register_resources_bulk(
+                db=mock_db,
+                resources=resources,
+                created_by="tester",
+                conflict_strategy="update",
+                user_email="owner@example.com",
+            )
 
         assert result["updated"] == 1
         assert result["created"] == 0
@@ -3588,6 +3595,82 @@ class TestResourceBulkRegistration:
         assert existing.tags[0]["label"] == "updated"
         assert existing.version == 2
         mock_db.add_all.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("caller,owns", [("attacker@example.com", False), (None, True)])
+    async def test_register_resources_bulk_update_denied_for_non_owner(self, resource_service, mock_db, caller, owns):
+        """Bulk update never modifies a resource the caller does not own, and fails closed without a caller."""
+        existing = MagicMock(spec=DbResource)
+        existing.uri = "file:///victim.txt"
+        existing.gateway_id = None
+        existing.name = "Victim"
+        existing.description = "Victim desc"
+        existing.version = 1
+
+        mock_db.execute.return_value.scalars.return_value.all.return_value = [existing]
+        mock_db.add_all = MagicMock()
+        resource_service._notify_resource_added = AsyncMock()
+        resources = [ResourceCreate(name="Hijacked", uri="file:///victim.txt", description="Attacker desc", mime_type="text/plain", content="x")]
+
+        with patch("mcpgateway.services.permission_service.PermissionService.check_resource_ownership", new=AsyncMock(return_value=owns)):
+            result = await resource_service.register_resources_bulk(
+                db=mock_db,
+                resources=resources,
+                created_by=caller or "importer",
+                conflict_strategy="update",
+                user_email=caller,
+            )
+
+        assert result["updated"] == 0
+        assert result["failed"] == 1
+        assert "Permission denied" in result["errors"][0]
+        assert existing.name == "Victim"
+        assert existing.description == "Victim desc"
+        assert existing.version == 1
+
+    @pytest.mark.asyncio
+    async def test_register_resources_bulk_update_database_backed_ownership(self, resource_service, tmp_path):
+        """Real rows and real ownership decisions: a non-owner is denied, the owner and an admin are allowed."""
+        engine = create_engine(f"sqlite:///{tmp_path / 'ownership.db'}")
+        Base.metadata.create_all(engine)
+
+        with Session(engine) as seed:
+            seed.add_all(
+                [
+                    EmailUser(email="victim@example.com", password_hash="x", is_admin=False),
+                    EmailUser(email="attacker@example.com", password_hash="x", is_admin=False),
+                    EmailUser(email="admin@example.com", password_hash="x", is_admin=True),
+                ]
+            )
+            seed.add(DbResource(uri="file:///shared.txt", name="shared", description="victim", visibility="public", owner_email="victim@example.com", team_id="victim-team"))
+            seed.commit()
+
+        payload = ResourceCreate(name="shared", uri="file:///shared.txt", description="attacker", mime_type="text/plain", content="x")
+        resource_service._notify_resource_added = AsyncMock()
+
+        async def run(caller):
+            with Session(engine) as session, patch("mcpgateway.services.resource_service.audit_trail"):
+                return await resource_service.register_resources_bulk(db=session, resources=[payload], created_by=caller or "importer", conflict_strategy="update", user_email=caller)
+
+        def persisted():
+            with Session(engine) as check:
+                row = check.query(DbResource).filter_by(uri="file:///shared.txt").one()
+                return row.description, row.owner_email, row.team_id
+
+        for caller in ("attacker@example.com", None):
+            denied = await run(caller)
+            assert (denied["updated"], denied["failed"]) == (0, 1)
+            assert persisted() == ("victim", "victim@example.com", "victim-team")
+
+        assert (await run("victim@example.com"))["updated"] == 1
+        assert persisted() == ("attacker", "victim@example.com", "victim-team")
+
+        with Session(engine) as reset:
+            reset.query(DbResource).filter_by(uri="file:///shared.txt").one().description = "victim"
+            reset.commit()
+        assert (await run("admin@example.com"))["updated"] == 1
+        assert persisted()[1:] == ("victim@example.com", "victim-team")
+        engine.dispose()
 
     @pytest.mark.asyncio
     async def test_register_resources_bulk_rename_conflict_creates_new(self, resource_service, mock_db):
@@ -4679,6 +4762,57 @@ class TestInvokeResourceCoverage:
 
             result = await resource_service.invoke_resource(db, "res-1", "http://test.com", resource_obj=resource, gateway_obj=gateway)
         assert result == "http-ok"
+
+    @pytest.mark.asyncio
+    async def test_streamablehttp_non_pooled_read_records_the_upstream_cache_directive(self, resource_service):
+        """The per-call StreamableHTTP read keeps the upstream's ttlMs for the read adapter, scope private."""
+        resource = self._make_resource()
+        gateway = self._make_gateway(transport="streamablehttp", auth_type="header")
+        gateway.auth_value = "encoded-auth"
+
+        db = MagicMock()
+        db.close = MagicMock()
+
+        cs_session = AsyncMock()
+        cs_session.initialize = AsyncMock(return_value=None)
+        cs_session.read_resource.return_value = MagicMock(contents=[MagicMock(text="http-ok", blob=None)], ttl_ms=60_000, cache_scope="public")
+        # For resource_service's client.session path
+        cs_session.session = cs_session
+
+        span = MagicMock()
+
+        with (
+            patch(
+                "mcpgateway.services.resource_service.settings",
+                MagicMock(
+                    enable_ed25519_signing=False,
+                    platform_admin_email="admin@test.com",
+                    httpx_max_connections=10,
+                    httpx_max_keepalive_connections=5,
+                    httpx_keepalive_expiry=30,
+                    mcp_session_pool_enabled=False,
+                    health_check_timeout=1,
+                ),
+            ),
+            patch("mcpgateway.services.resource_service.current_trace_id") as mock_trace,
+            patch(
+                "mcpgateway.services.resource_service.create_span",
+                MagicMock(return_value=MagicMock(__enter__=MagicMock(return_value=span), __exit__=MagicMock(return_value=False))),
+            ),
+            patch("mcpgateway.services.resource_service.decode_auth", return_value=None),
+            patch("mcpgateway.services.metrics_buffer_service.get_metrics_buffer_service") as mock_metrics_buffer,
+            patch("mcpgateway.services.resource_service.mcp_proxy_client") as mock_http,
+        ):
+            mock_trace.get = MagicMock(return_value=None)
+            mock_metrics_buffer.return_value = MagicMock()
+
+            mock_http.return_value.__aenter__ = AsyncMock(return_value=cs_session)
+            mock_http.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            upstream_read_cache_var.set(None)
+            result = await resource_service.invoke_resource(db, "res-1", "http://test.com", resource_obj=resource, gateway_obj=gateway)
+        assert result == "http-ok"
+        assert upstream_read_cache_var.get() == {"ttl_ms": 60_000, "cache_scope": "private"}
 
     @pytest.mark.asyncio
     async def test_sse_registry_used_and_signature_validated(self, resource_service):
@@ -8206,6 +8340,56 @@ class TestReadResourceDirectProxy:
         session_mock.read_resource.assert_awaited_once_with(uri="http://example.com/dp-resource")
 
     @pytest.mark.asyncio
+    async def test_read_resource_direct_proxy_records_the_upstream_cache_directive(self, resource_service, mock_direct_proxy_resource):
+        """The direct-proxy read keeps the upstream's ttlMs for the read adapter, scope private."""
+        # Standard
+        from contextlib import asynccontextmanager
+
+        db = self._make_mock_db(mock_direct_proxy_resource)
+
+        # Remote session returns text content
+        first_content = MagicMock()
+        first_content.text = "hello from remote"
+        first_content.mime_type = "text/plain"
+        result_mock = MagicMock()
+        result_mock.contents = [first_content]
+        result_mock.ttl_ms = 60_000
+        result_mock.cache_scope = "public"
+        session_mock = self._make_session_mock(result_mock)
+
+        @asynccontextmanager
+        async def mock_streamable_client(*_args, **_kwargs):
+            yield session_mock
+
+        with (
+            patch("mcpgateway.services.resource_service.settings") as mock_settings,
+            patch("mcpgateway.services.resource_service.check_gateway_access", new_callable=AsyncMock, return_value=True),
+            patch("mcpgateway.services.resource_service.build_gateway_auth_headers", return_value={"Authorization": "Bearer remote-token"}),
+            patch("mcpgateway.services.resource_service.mcp_proxy_client", mock_streamable_client),
+            self._common_patches(resource_service) as invoke_resource,
+        ):
+            mock_settings.mcpgateway_direct_proxy_enabled = True
+            mock_settings.mcpgateway_direct_proxy_timeout = 30
+            mock_settings.experimental_validate_io = False
+
+            upstream_read_cache_var.set(None)
+            content = await resource_service.read_resource(
+                db,
+                resource_uri="http://example.com/dp-resource",
+                user="user@example.com",
+                token_teams=["team-1"],
+            )
+
+        # direct_proxy now returns the FINAL content shape (ResourceContent) so the
+        # cache-mode pointer-resolution machinery is never re-run on proxied content.
+        assert isinstance(content, _FinalContent)
+        assert content.text == "hello from remote"
+        assert content.uri == "http://example.com/dp-resource"
+        invoke_resource.assert_not_awaited()
+        session_mock.read_resource.assert_awaited_once_with(uri="http://example.com/dp-resource")
+        assert upstream_read_cache_var.get() == {"ttl_ms": 60_000, "cache_scope": "private"}
+
+    @pytest.mark.asyncio
     async def test_read_resource_direct_proxy_blob_content(self, resource_service, mock_direct_proxy_resource):
         """Happy path: resource gateway in direct_proxy mode returns blob content."""
         # Standard
@@ -9074,3 +9258,30 @@ class TestResourceUriUniquenessScope:
         result = await service.update_resource(db, target.id, ResourceUpdate(name="Original"))
 
         assert result.name == "Original"
+
+
+class TestUpstreamReadCacheDirective:
+    """The upstream read's ttlMs is kept for the read adapter; cacheScope is always private."""
+
+    def _directive(self, result):
+        # First-Party
+        from mcpgateway.services.resource_service import set_upstream_cache_directive, upstream_read_cache_var
+
+        token = upstream_read_cache_var.set(None)
+        try:
+            set_upstream_cache_directive(result)
+            return upstream_read_cache_var.get()
+        finally:
+            upstream_read_cache_var.reset(token)
+
+    def test_modern_upstream_ttl_is_relayed(self):
+        """ttlMs comes through as the upstream sent it."""
+        assert self._directive(SimpleNamespace(contents=[], ttl_ms=60_000, cache_scope="private")) == {"ttl_ms": 60_000, "cache_scope": "private"}
+
+    def test_upstream_public_scope_is_never_relayed(self):
+        """A response authorized for one principal must not be declared shareable, whatever the upstream said."""
+        assert self._directive(SimpleNamespace(contents=[], ttl_ms=60_000, cache_scope="public")) == {"ttl_ms": 60_000, "cache_scope": "private"}
+
+    def test_legacy_upstream_without_the_fields_gives_the_defaults(self):
+        """A 2025-era upstream sends neither field: ttlMs 0, private."""
+        assert self._directive(SimpleNamespace(contents=[])) == {"ttl_ms": 0, "cache_scope": "private"}

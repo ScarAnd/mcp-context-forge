@@ -96,6 +96,32 @@ def test_ui_base_url_allows_path_prefix():
     assert str(configured.ui_base_url) == "https://ui.example.com/contextforge"
 
 
+@pytest.mark.parametrize(
+    "suffix, expected",
+    [
+        ("/app", "/"),
+        ("/app/", "/"),
+        ("/contextforge/app/", "/contextforge"),
+        ("/app/app", "/app"),
+        ("/app/app/", "/app"),
+        ("/contextforge/app/app", "/contextforge/app"),
+        ("/contextforge/app/app/app/", "/contextforge/app/app"),
+    ],
+)
+def test_ui_base_url_removes_only_frontend_mount(caplog, suffix, expected):
+    """Full frontend roots retain deployment path segments named app."""
+    caplog.set_level(logging.WARNING, logger="mcpgateway.config")
+    configured = Settings(ui_base_url=f"https://ui.example.com{suffix}", environment="development", _env_file=None)
+    assert str(configured.ui_base_url) == f"https://ui.example.com{expected}"
+    assert "removing the trailing /app" in caplog.text
+
+
+def test_ui_base_url_preserves_similar_path():
+    """Deployment prefixes that merely contain app remain unchanged."""
+    configured = Settings(ui_base_url="https://ui.example.com/myapp", environment="development", _env_file=None)
+    assert str(configured.ui_base_url) == "https://ui.example.com/myapp"
+
+
 def test_ui_base_url_treats_blank_string_as_unset():
     """Blank environment override preserves gateway UI fallback behavior."""
     configured = Settings(ui_base_url="", environment="development", _env_file=None)
@@ -106,7 +132,7 @@ def test_ui_base_url_treats_blank_string_as_unset():
     ("admin_api_enabled", "expected_password_route"),
     [
         (True, "legacy /admin routes"),
-        (False, "frontend /forgot-password and /reset-password/{token} routes"),
+        (False, "frontend /app/forgot-password and /app/reset-password/{token} routes"),
     ],
 )
 def test_smtp_without_ui_base_url_warns_about_frontend_routes(caplog, admin_api_enabled, expected_password_route):
@@ -117,7 +143,7 @@ def test_smtp_without_ui_base_url_warns_about_frontend_routes(caplog, admin_api_
 
     warnings = [record.getMessage() for record in caplog.records]
     assert any("SMTP_ENABLED=true while UI_BASE_URL is unset" in message for message in warnings)
-    assert any("/accept-invitation/{token}" in message for message in warnings)
+    assert any("/app/accept-invitation/{token}" in message for message in warnings)
     assert any(expected_password_route in message for message in warnings)
 
 
@@ -1786,42 +1812,6 @@ def test_mcp_require_auth_defaults_to_auth_required_false():
     assert s.mcp_require_auth is False
 
 
-def test_experimental_rust_mcp_runtime_defaults():
-    """Experimental Rust MCP runtime settings should default to disabled with local sidecar URL."""
-    s = Settings(environment="development", _env_file=None)
-    assert s.experimental_rust_mcp_runtime_enabled is False
-    assert s.experimental_rust_mcp_runtime_url == "http://127.0.0.1:8787"
-    assert s.experimental_rust_mcp_runtime_uds is None
-    assert s.experimental_rust_mcp_runtime_timeout_seconds == 30
-    assert s.experimental_rust_mcp_session_core_enabled is False
-    assert s.experimental_rust_mcp_event_store_enabled is False
-    assert s.experimental_rust_mcp_resume_core_enabled is False
-    assert s.experimental_rust_mcp_live_stream_core_enabled is False
-    assert s.experimental_rust_mcp_affinity_core_enabled is False
-    assert s.experimental_rust_mcp_session_auth_reuse_enabled is False
-
-
-def test_experimental_rust_mcp_runtime_uds_accepts_absolute_path(tmp_path: Path):
-    """The optional Rust runtime UDS path should round-trip when configured."""
-    uds_path = tmp_path / "contextforge-rust.sock"
-    s = Settings(experimental_rust_mcp_runtime_uds=str(uds_path), environment="development", _env_file=None)
-    assert s.experimental_rust_mcp_runtime_uds == str(uds_path)
-
-
-def test_experimental_rust_mcp_runtime_uds_rejects_relative_path():
-    """The Rust runtime UDS path must be absolute."""
-    with pytest.raises(ValueError, match="must be an absolute path"):
-        Settings(experimental_rust_mcp_runtime_uds="relative.sock", environment="development", _env_file=None)
-
-
-def test_experimental_rust_mcp_runtime_uds_rejects_missing_parent(tmp_path: Path):
-    """The Rust runtime UDS parent directory must already exist."""
-    missing_parent = tmp_path / "missing" / "contextforge-rust.sock"
-    with pytest.raises(ValueError, match="parent directory does not exist"):
-        Settings(experimental_rust_mcp_runtime_uds=str(missing_parent), _env_file=None)
-
-
-
 def test_auth_required_true_with_explicit_mcp_permissive_warns(caplog):
     """AUTH_REQUIRED=true with explicit MCP_REQUIRE_AUTH=false should warn."""
     caplog.set_level("WARNING", logger="mcpgateway.config")
@@ -2500,10 +2490,10 @@ def test_min_secret_length_below_floor_raises_validation_error():
 # --------------------------------------------------------------------------- #
 #                    mcp_client_connect_mode                                     #
 # --------------------------------------------------------------------------- #
-def test_mcp_client_connect_mode_defaults_to_legacy():
-    """Library default is 'legacy'."""
+def test_mcp_client_connect_mode_defaults_to_auto():
+    """Library default is 'auto'."""
     s = Settings(_env_file=None)
-    assert s.mcp_client_connect_mode == "legacy"
+    assert s.mcp_client_connect_mode == "auto"
 
 
 @pytest.mark.parametrize("valid_value", ["auto", "legacy"])
@@ -2537,10 +2527,10 @@ def test_mcp_client_connect_mode_env_var_honored(monkeypatch):
 # --------------------------------------------------------------------------- #
 #                    mcp_inbound_protocol_mode                                  #
 # --------------------------------------------------------------------------- #
-def test_mcp_inbound_protocol_mode_defaults_to_legacy():
-    """Library default is 'legacy'."""
+def test_mcp_inbound_protocol_mode_defaults_to_auto():
+    """Library default is 'auto'."""
     s = Settings(_env_file=None)
-    assert s.mcp_inbound_protocol_mode == "legacy"
+    assert s.mcp_inbound_protocol_mode == "auto"
 
 
 @pytest.mark.parametrize("valid_value", ["auto", "legacy"])
@@ -2569,3 +2559,74 @@ def test_mcp_inbound_protocol_mode_env_var_honored(monkeypatch):
     with patch.dict(os.environ, dummy_env, clear=True):
         s = Settings(_env_file=None)
         assert s.mcp_inbound_protocol_mode == "legacy"
+
+
+# --------------------------------------------------------------------------- #
+#                    _parse_mcp_origin_sets                                    #
+# --------------------------------------------------------------------------- #
+# _parse_allowed_origins (unified validator for allowed_origins, mcp_allowed_origins,
+# mcp_allowed_hosts)
+# --------------------------------------------------------------------------- #
+def test_parse_mcp_origin_sets_json_array():
+    """JSON array string is parsed into a set."""
+    result = Settings._parse_allowed_origins('["https://a.com","https://b.com"]')
+    assert result == {"https://a.com", "https://b.com"}
+
+
+def test_parse_mcp_origin_sets_csv_string():
+    """Comma-separated string is parsed into a set."""
+    result = Settings._parse_allowed_origins("https://x.com , https://y.com")
+    assert result == {"https://x.com", "https://y.com"}
+
+
+def test_parse_mcp_origin_sets_empty_string():
+    """Blank string returns empty set."""
+    assert Settings._parse_allowed_origins("") == set()
+    assert Settings._parse_allowed_origins("   ") == set()
+
+
+def test_parse_mcp_origin_sets_quoted_string():
+    """Outer quote pair is stripped before parsing."""
+    result = Settings._parse_allowed_origins('"https://a.com,https://b.com"')
+    assert "https://a.com" in result
+    assert "https://b.com" in result
+
+
+def test_parse_mcp_origin_sets_set_passthrough():
+    """An already-parsed set is returned as-is."""
+    assert Settings._parse_allowed_origins({"https://a.com"}) == {"https://a.com"}
+
+
+def test_parse_mcp_origin_sets_list_passthrough():
+    """A list is converted to a set."""
+    assert Settings._parse_allowed_origins(["https://a.com", "https://b.com"]) == {"https://a.com", "https://b.com"}
+
+
+def test_parse_mcp_origin_sets_unknown_type_returns_empty():
+    """An unrecognised type (e.g. int) falls back to empty set."""
+    assert Settings._parse_allowed_origins(42) == set()  # type: ignore[arg-type]
+
+
+def test_mcp_allowed_origins_settings_field():
+    """mcp_allowed_origins is parsed correctly when passed to Settings."""
+    s = Settings(mcp_allowed_origins="https://trusted.example.com", environment="development", _env_file=None)
+    assert "https://trusted.example.com" in s.mcp_allowed_origins
+
+
+def test_mcp_allowed_hosts_settings_field():
+    """mcp_allowed_hosts is parsed correctly when passed to Settings."""
+    s = Settings(mcp_allowed_hosts="myapp.example.com:4444,myapp.example.com:*", environment="development", _env_file=None)
+    assert "myapp.example.com:4444" in s.mcp_allowed_hosts
+    assert "myapp.example.com:*" in s.mcp_allowed_hosts
+
+
+def test_mcp_allowed_origins_default_empty():
+    """mcp_allowed_origins defaults to empty set."""
+    s = Settings(environment="development", _env_file=None)
+    assert s.mcp_allowed_origins == set()
+
+
+def test_mcp_allowed_hosts_default_empty():
+    """mcp_allowed_hosts defaults to empty set."""
+    s = Settings(environment="development", _env_file=None)
+    assert s.mcp_allowed_hosts == set()

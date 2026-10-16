@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Literal, Optional, Pattern, Self, Union
 from urllib.parse import urlparse
 
 # Third-Party
+from mcp.shared.inbound import find_invalid_x_mcp_header
 import orjson
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, EmailStr, Field, field_serializer, field_validator, model_serializer, model_validator, SecretStr, ValidationInfo
 
@@ -38,7 +39,7 @@ from mcpgateway.common.models import Resource as MCPResource
 from mcpgateway.common.models import ResourceContent, TextContent
 from mcpgateway.common.models import Tool as MCPTool
 from mcpgateway.common.models import ToolAnnotations
-from mcpgateway.common.oauth import OAUTH_SENSITIVE_KEYS
+from mcpgateway.common.oauth import normalize_token_endpoint_auth_method, OAUTH_SENSITIVE_KEYS, SUPPORTED_TOKEN_ENDPOINT_AUTH_METHODS, SUPPORTED_TOKEN_ENDPOINT_SIGNING_ALGS
 from mcpgateway.common.validators import SecurityValidator, validate_core_url
 from mcpgateway.config import settings
 from mcpgateway.utils.base_models import BaseModelWithConfigDict
@@ -128,6 +129,51 @@ _SENSITIVE_HEADER_MAPPING_PATTERNS = (
 )
 
 
+def _validate_oauth_token_endpoint_auth(v: Dict[str, Any]) -> None:
+    """Validate the token endpoint client authentication settings structurally.
+
+    Structural rules match the runtime exactly because both read the same
+    constant sets: an unknown ``token_endpoint_auth_method`` or signing
+    algorithm is rejected here so a config value can never pass the API
+    boundary and then fail or silently switch behavior later.
+
+    Args:
+        v: OAuth configuration dict.
+
+    Raises:
+        ValueError: If the method, algorithm, key ID, or signing key is invalid.
+    """
+    raw_method = v.get("token_endpoint_auth_method")
+    # Normalize before the membership test, not after. Empty and whitespace-only
+    # values are legacy spellings of the POST default (RFC 6749 Section 2.3.1);
+    # comparing the raw string rejected them with a 422 while the runtime
+    # happily defaulted them, so a previously working config broke the moment a
+    # client resubmitted it. normalize_token_endpoint_auth_method() is the one
+    # policy point the schema, the dispatch, and the retry refresh all read.
+    method = normalize_token_endpoint_auth_method(raw_method)
+    if method is None:
+        raise ValueError("oauth_config.token_endpoint_auth_method must be a string")
+    if method not in SUPPORTED_TOKEN_ENDPOINT_AUTH_METHODS:
+        raise ValueError(f"oauth_config.token_endpoint_auth_method is not supported. Supported values: {', '.join(sorted(SUPPORTED_TOKEN_ENDPOINT_AUTH_METHODS))}")
+
+    raw_alg = v.get("token_endpoint_auth_signing_alg")
+    if raw_alg is not None:
+        if not isinstance(raw_alg, str):
+            raise ValueError("oauth_config.token_endpoint_auth_signing_alg must be a string")
+        if raw_alg not in SUPPORTED_TOKEN_ENDPOINT_SIGNING_ALGS:
+            raise ValueError(f"oauth_config.token_endpoint_auth_signing_alg is not allowed. Supported values: {', '.join(sorted(SUPPORTED_TOKEN_ENDPOINT_SIGNING_ALGS))}")
+
+    raw_kid = v.get("private_key_jwt_kid")
+    if raw_kid is not None and raw_kid != "":
+        if not isinstance(raw_kid, str) or not raw_kid.strip():
+            raise ValueError("oauth_config.private_key_jwt_kid must be a non-empty string when provided")
+
+    if method == "private_key_jwt":
+        private_key = v.get("private_key")
+        if not isinstance(private_key, str) or not private_key.strip():
+            raise ValueError("oauth_config.private_key is required when token_endpoint_auth_method is private_key_jwt")
+
+
 def _validate_oauth_config_urls(v: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Validate URL-bearing OAuth config entries against core URL/SSRF rules.
 
@@ -148,6 +194,7 @@ def _validate_oauth_config_urls(v: Optional[Dict[str, Any]]) -> Optional[Dict[st
         return v
     if not isinstance(v, dict):
         raise ValueError("oauth_config must be an object")
+    _validate_oauth_token_endpoint_auth(v)
     for field_name in ("token_url", "authorization_url", "issuer", "authorization_server", "redirect_uri", "jwks_uri"):
         raw_value = v.get(field_name)
         if raw_value in (None, ""):
@@ -525,6 +572,13 @@ class AuthenticationValues(BaseModelWithConfigDict):
 
 # Minimal valid JSON Schema used as the default input_schema for REST tools.
 _DEFAULT_INPUT_SCHEMA: dict = {"type": "object", "properties": {}}
+
+
+def _reject_invalid_x_mcp_header(schema: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Reject an input schema whose ``x-mcp-header`` annotations break the MCP 2026-07-28 constraints."""
+    if schema is not None and (reason := find_invalid_x_mcp_header(schema)) is not None:
+        raise ValueError(f"invalid x-mcp-header annotation: {reason}")
+    return schema
 
 
 def _extract_rest_url_components(values: dict) -> dict:
@@ -977,6 +1031,12 @@ class ToolCreate(BaseModel):
             ValueError: If the filter uses a restricted jq built-in.
         """
         return _validate_jsonpath_filter_value(value)
+
+    @field_validator("input_schema")
+    @classmethod
+    def validate_x_mcp_header_annotations(cls, v: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Reject ``x-mcp-header`` annotations that conforming MCP clients would drop the tool for."""
+        return _reject_invalid_x_mcp_header(v)
 
     @field_validator("headers", "input_schema", "annotations")
     @classmethod
@@ -1536,6 +1596,12 @@ class ToolUpdate(BaseModelWithConfigDict):
         """
         return _validate_jsonpath_filter_value(value)
 
+    @field_validator("input_schema")
+    @classmethod
+    def validate_x_mcp_header_annotations(cls, v: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Reject ``x-mcp-header`` annotations that conforming MCP clients would drop the tool for."""
+        return _reject_invalid_x_mcp_header(v)
+
     @field_validator("headers", "input_schema", "annotations")
     @classmethod
     def validate_json_fields(cls, v: Dict[str, Any]) -> Dict[str, Any]:
@@ -2074,9 +2140,10 @@ class ToolResult(BaseModelWithConfigDict):
     """
 
     content: List[Union[TextContent, ImageContent]]
-    structured_content: Optional[Dict[str, Any]] = None
+    structured_content: Optional[Any] = Field(default=None, description="Machine-readable result; any JSON value on the 2026 wire, an object only on the 2025 wire")
     is_error: bool = False
     error_message: Optional[str] = None
+    meta: Optional[Dict[str, Any]] = Field(default=None, alias="_meta", description="MCP result metadata, e.g. the JSON-RPC error code of a failed call under io.contextforge/errorCode")
 
 
 class ToolPreviewRequest(BaseModelWithConfigDict):
@@ -3253,7 +3320,10 @@ class GatewayCreate(BaseModelWithConfigDict):
 
     # OAuth 2.0 configuration
     oauth_config: Optional[Dict[str, Any]] = Field(
-        None, description="OAuth 2.0 configuration including grant_type, client_id, encrypted client_secret, URLs, scopes, audience (for Atlassian/Auth0), and resource (RFC 8707)"
+        None,
+        description="OAuth 2.0 configuration including grant_type, client_id, encrypted client_secret, URLs, scopes, audience (for Atlassian/Auth0), resource (RFC 8707), "
+        "token_endpoint_auth_method (none, client_secret_basic, client_secret_post, private_key_jwt), and for private_key_jwt: private_key, optional "
+        "token_endpoint_auth_signing_alg (RS256 default; RS384, RS512, ES256, ES384, ES512, PS256) and optional private_key_jwt_kid",
     )
 
     # Query Parameter Authentication (INSECURE)
@@ -3663,7 +3733,10 @@ class GatewayUpdate(BaseModelWithConfigDict):
 
     # OAuth 2.0 configuration
     oauth_config: Optional[Dict[str, Any]] = Field(
-        None, description="OAuth 2.0 configuration including grant_type, client_id, encrypted client_secret, URLs, scopes, audience (for Atlassian/Auth0), and resource (RFC 8707)"
+        None,
+        description="OAuth 2.0 configuration including grant_type, client_id, encrypted client_secret, URLs, scopes, audience (for Atlassian/Auth0), resource (RFC 8707), "
+        "token_endpoint_auth_method (none, client_secret_basic, client_secret_post, private_key_jwt), and for private_key_jwt: private_key, optional "
+        "token_endpoint_auth_signing_alg (RS256 default; RS384, RS512, ES256, ES384, ES512, PS256) and optional private_key_jwt_kid",
     )
 
     # Query Parameter Authentication (INSECURE)
@@ -5061,6 +5134,32 @@ class GatewayHandshakeRequest(BaseModelWithConfigDict):
     base_url: AnyHttpUrl = Field(..., description="Base URL of the MCP server to test")
     path: Optional[str] = Field(None, description="Optional path appended to the base URL")
     headers: Optional[Dict[str, str]] = Field(None, description="Optional headers (e.g. Authorization) sent with the handshake")
+    gateway_id: Optional[str] = Field(
+        None,
+        description=("Exact registered gateway to use for transport, TLS, and stored-credential settings; combined with credential_mode to control whether stored credentials are applied"),
+    )
+    credential_mode: Literal["stored_with_override", "candidate_only"] = Field(
+        "stored_with_override",
+        description=(
+            "Credential handling mode. "
+            "'stored_with_override' applies stored gateway credentials; form headers take precedence. "
+            "'candidate_only' suppresses all stored credentials so only the supplied headers are tested."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_candidate_only_gateway(self) -> "GatewayHandshakeRequest":
+        """Require exact gateway selection for candidate-only validation.
+
+        Returns:
+            The validated request.
+
+        Raises:
+            ValueError: If candidate-only validation omits the gateway ID.
+        """
+        if self.credential_mode == "candidate_only" and not self.gateway_id:
+            raise ValueError("gateway_id is required when credential_mode is candidate_only")
+        return self
 
     @field_validator("path")
     @classmethod
@@ -6210,6 +6309,65 @@ class A2AAgentInvocation(BaseModelWithConfigDict):
         return v
 
 
+class A2AInvocationResponse(BaseModel):
+    """Schema for the body returned by the A2A invocation routes.
+
+    Contains:
+    - The JSON-RPC fields the target agent echoed back (result or error, plus the id)
+    - Any extra keys the agent returned, which extra="allow" keeps in the response
+
+    Field values are deliberately untyped. These routes forward the JSON document the
+    agent produced, so a stricter type would convert unexpected agent behavior into a
+    gateway 500 instead of the agent's own response. Payloads the repository itself
+    documents already push against the spec: the A2A user guide shows ``status.message``
+    as a plain string, and the passthrough tests carry ``status`` as a bare state name.
+
+    A2A 0.3 and 1.0 differ inside ``result`` rather than at this level: 0.3 discriminates
+    with a ``kind`` field and uses lowercase task states (``input-required``) with
+    ``user``/``agent`` roles, while 1.0 discriminates by field presence and uses
+    ``TASK_STATE_*`` states with ``ROLE_USER``/``ROLE_AGENT`` roles.
+
+    Extra agent fields remain on the wire; generated clients may not expose them,
+    so the named schema is a lower bound rather than an exhaustive field list.
+    Related JSON-RPC envelopes are :class:`RPCResponse` and
+    :class:`mcpgateway.common.models.JSONRPCResponse`.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    jsonrpc: Any = Field(default=None, description="JSON-RPC protocol version echoed by the agent")
+    result: Any = Field(default=None, description="Result payload forwarded from the agent")
+    error: Any = Field(default=None, description="Error forwarded from the agent")
+    id: Any = Field(default=None, description="Request id this response correlates to, omitted for notifications")
+
+
+class A2AInvokeResponse(A2AInvocationResponse):
+    """Schema for ``POST /v1/a2a/{agent_name}/invoke`` and ``POST /v1/a2a/invoke``.
+
+    Both routes hand the agent's document to the caller after ContextForge governance
+    (auth, RBAC, rate limiting, metrics) without reshaping it. When the gateway has
+    nothing to forward, ``error`` carries a plain message string rather than a JSON-RPC
+    error object and the remaining keys are absent.
+
+    Its fields deliberately match :class:`A2AJsonRpcResponse`, while the two class
+    names provide distinct OpenAPI components for the corresponding routes.
+    """
+
+
+class A2AJsonRpcResponse(A2AInvocationResponse):
+    """Schema for ``POST /v1/a2a/{agent_name}/jsonrpc``.
+
+    This passthrough always answers with a JSON-RPC envelope: an agent document that
+    already carries ``jsonrpc`` is returned unchanged, otherwise the agent's response is
+    wrapped as ``{"jsonrpc": "2.0", "result": ...}``. ``id`` is only present when the
+    request had one. The gateway's own JSON-RPC error replies are returned as explicit
+    responses with a non-2xx status, so they bypass this model.
+
+    Its fields deliberately match :class:`A2AInvokeResponse`; the separate class
+    name provides a distinct OpenAPI component for this route.
+    """
+
+
 # ---------------------------------------------------------------------------
 # A2A Task Schemas
 # ---------------------------------------------------------------------------
@@ -6488,6 +6646,22 @@ class AdminCreateUserRequest(BaseModel):
     is_admin: bool = Field(False, description="Grant admin privileges to user")
     is_active: bool = Field(True, description="Whether user account is active")
     password_change_required: bool = Field(False, description="Whether user must change password on next login")
+
+
+class AdminCreateSSOUserRequest(BaseModel):
+    """Administrator-driven passwordless SSO user creation request.
+
+    Providers are validated against enabled provider rows by the service. The
+    endpoint rejects a password key before validating this schema.
+    """
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    email: EmailStr = Field(..., description="User's email address")
+    auth_provider: str = Field(..., description="Configured SSO provider ID; azure-ad is an alias for entra")
+    full_name: Optional[str] = Field(None, max_length=255, description="User's full name")
+    is_admin: bool = Field(False, description="Grant admin privileges to user")
+    is_active: bool = Field(True, description="Whether user account is active")
 
 
 # Deprecated alias — use AdminCreateUserRequest or PublicRegistrationRequest instead
@@ -9123,7 +9297,6 @@ class HealthCheckResponse(BaseModel):
 
     status: str = Field(..., description="Overall health status: 'healthy' if all components are healthy, 'unhealthy' otherwise")
     status_items: List[HealthStatusItem] = Field(..., description="List of component health statuses")
-    mcp_runtime: Dict[str, Any] = Field(default_factory=dict, description="MCP runtime diagnostics and configuration")
 
 
 class GunicornMetricsSchema(BaseModel):
@@ -9413,11 +9586,6 @@ class PydanticA2AAgent(BaseModelWithConfigDict):
     auth_type: Optional[str] = Field(None, description="Authentication type")
     content_type: Optional[str] = Field(None, description="Content-Type of the inbound request")
     endpoint_url: Optional[str] = Field(None, description="Registered endpoint URL for the agent, as configured at registration time")
-
-    class Config:
-        """Pydantic config for A2A agent metadata."""
-
-        from_attributes = True  # SQLAlchemy ORM compatibility
 
 
 class A2AAgentPluginBindingRequest(BaseModelWithConfigDict):

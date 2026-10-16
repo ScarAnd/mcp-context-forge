@@ -39,7 +39,6 @@ from dataclasses import dataclass
 from enum import Enum
 import re
 from typing import Any, assert_never, AsyncGenerator, ContextManager, Dict, Iterable, List, Optional, Pattern, Tuple, Union
-from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 # Third-Party
@@ -47,7 +46,6 @@ import anyio
 from cpex.framework import GlobalContext, PluginContextTable, PluginViolationError
 from fastapi import HTTPException
 from fastapi.security.utils import get_authorization_scheme_param
-import httpx
 import jwt
 from mcp.server.lowlevel import Server
 from mcp.shared.exceptions import MCPError
@@ -55,9 +53,9 @@ from mcp.server.streamable_http import EventCallback, EventId, EventMessage, Eve
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 import mcp_types as types
 from mcp_types import JSONRPCMessage
-from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS
+from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS, MODERN_PROTOCOL_VERSIONS
 import orjson
-from sqlalchemy import select
+from sqlalchemy import select, union
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.datastructures import Headers
@@ -65,17 +63,21 @@ from starlette.status import HTTP_200_OK, HTTP_401_UNAUTHORIZED, HTTP_403_FORBID
 from starlette.types import Receive, Scope, Send
 
 # First-Party
+from mcpgateway import __version__
 from mcpgateway.cache.global_config_cache import global_config_cache
 from mcpgateway.common.models import LogLevel
 from mcpgateway.common.validators import validate_meta_data as _validate_meta_data
 from mcpgateway.config import settings
 from mcpgateway.db import Gateway as DbGateway
+from mcpgateway.db import Prompt as DbPrompt
+from mcpgateway.db import Resource as DbResource
+from mcpgateway.db import server_prompt_association, server_resource_association, server_tool_association
 from mcpgateway.db import Server as DbServer
+from mcpgateway.db import Tool as DbTool
 from mcpgateway.db import SessionLocal
 from mcpgateway.middleware.rbac import _ACCESS_DENIED_MSG
 from mcpgateway.observability import create_span, inject_trace_context_headers, set_span_attribute
-from mcpgateway.services.completion_service import CompletionService
-from mcpgateway.services.http_client_service import get_http_client, get_http_limits
+from mcpgateway.services.completion_service import CompletionError, CompletionService, completion_error_code
 from mcpgateway.services.logging_service import LoggingService
 from mcpgateway.services.mcp_apps import (
     apply_resource_meta,
@@ -93,8 +95,8 @@ from mcpgateway.services.metrics import (
 )
 from mcpgateway.services.oauth_manager import OAuthEnforcementUnavailableError, OAuthRequiredError
 from mcpgateway.services.permission_service import PermissionService
-from mcpgateway.services.prompt_service import PromptNotFoundError, PromptService
-from mcpgateway.services.resource_service import ResourceNotFoundError, ResourceService
+from mcpgateway.services.prompt_service import PromptNotFoundError, PromptService, PromptUpstreamError, PromptValidationError
+from mcpgateway.services.resource_service import ResourceNotFoundError, ResourceService, set_upstream_cache_directive, upstream_read_cache_var
 from mcpgateway.services.tool_service import ToolInputRequired, ToolInvocationError, ToolNotFoundError, ToolService
 from mcpgateway.transports.context import UserContext
 from mcpgateway.transports.redis_event_store import RedisEventStore
@@ -119,6 +121,144 @@ from mcpgateway.utils.verify_credentials import (
 # Initialize logging service first
 logging_service = LoggingService()
 logger = logging_service.get_logger(__name__)
+
+
+def _parse_mcp_scope_headers(scope: Scope) -> dict[str, str]:
+    """Extract and normalise HTTP headers from an ASGI scope into a lowercase str dict.
+
+    Args:
+        scope: ASGI scope dict.
+
+    Returns:
+        Dict mapping lowercase header name to decoded value.
+    """
+    result: dict[str, str] = {}
+    for item in scope.get("headers") or []:
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            continue
+        name, value = item
+        if not isinstance(name, (bytes, bytearray)) or not isinstance(value, (bytes, bytearray)):
+            continue
+        result[name.decode("latin-1").lower()] = value.decode("latin-1")
+    return result
+
+
+def _check_mcp_origin(origin: Optional[str]) -> bool:
+    """Return True when the Origin header is allowed for MCP Streamable HTTP ingress.
+
+    Missing Origin (``None``) is always accepted. An empty-string Origin is treated as
+    present-and-must-match. When ``mcp_allowed_origins`` is empty, all origins are
+    accepted (opt-in enforcement). Otherwise the origin must be an exact member of the
+    configured set or the request must be rejected with HTTP 403.
+
+    Args:
+        origin: Value of the Origin header, or None when absent.
+
+    Returns:
+        True when the request should proceed, False when it must be rejected.
+    """
+    if origin is None:
+        return True
+    if not settings.mcp_allowed_origins:
+        return True
+    return origin in settings.mcp_allowed_origins
+
+
+# Loopback hostname literals. Port is stripped before the check.
+# A DNS-rebound page cannot control the loopback address in Host; only genuine
+# same-host callers (e.g. test_server_handshake in-process self-calls) send these.
+_LOOPBACK_HOSTNAMES: frozenset[str] = frozenset({"127.0.0.1", "localhost", "[::1]", "::1"})
+
+
+def _check_mcp_host(host: Optional[str]) -> bool:
+    """Return True when the Host header is allowed for MCP Streamable HTTP ingress.
+
+    Missing Host (``None``) is always accepted. An empty-string Host is treated as
+    present-and-must-match. Loopback literals (``127.0.0.1``, ``localhost``,
+    ``[::1]``) are always accepted regardless of the allowlist — in-process
+    self-calls (e.g. ``test_server_handshake``) send these and a DNS-rebound page
+    cannot forge a loopback hostname in ``Host``. When ``mcp_allowed_hosts`` is
+    empty all other hosts are accepted (opt-in enforcement). Otherwise the host
+    must be an exact member of the configured set or the request is rejected.
+
+    Args:
+        host: Value of the Host header, or None when absent.
+
+    Returns:
+        True when the request should proceed, False when it must be rejected.
+    """
+    if host is None:
+        return True
+    # Strip port suffix (host:port or [::1]:port) before loopback check.
+    bare = host.rsplit(":", 1)[0] if ":" in host else host
+    # De-bracket IPv6 literals: "[::1]" → "::1"
+    if bare.startswith("[") and bare.endswith("]"):
+        bare = bare[1:-1]
+    if bare in _LOOPBACK_HOSTNAMES:
+        return True
+    if not settings.mcp_allowed_hosts:
+        return True
+    return host in settings.mcp_allowed_hosts
+
+
+class MCPOriginHostGate:
+    """ASGI gate that enforces MCP Origin/Host allowlists at the public /mcp mount.
+
+    Runs before any ingress dispatch (Python, rust-internal, rust-public) so the
+    check is not duplicated per-transport. The ``/_internal/mcp/transport`` bridge
+    is mounted separately and intentionally bypasses this gate — requests on that
+    path arrive from the trusted Rust sidecar at 127.0.0.1 only.
+
+    When session-affinity is enabled, loopback-sourced requests carrying
+    ``x-forwarded-internally: true`` are also bypassed (worker-to-worker routing).
+    The bypass is gated on affinity being enabled so a DNS-rebound page on loopback
+    cannot spoof the header when affinity is off (the default).
+    """
+
+    def __init__(self, app: Any) -> None:
+        """Wrap an ASGI application with the Origin/Host gate.
+
+        Args:
+            app: Downstream ASGI callable.
+        """
+        self._app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        """Enforce Origin/Host allowlists before dispatching to the wrapped app.
+
+        Args:
+            scope: ASGI scope dict.
+            receive: ASGI receive callable.
+            send: ASGI send callable.
+        """
+        if scope.get("type") != "http":
+            await self._app(scope, receive, send)
+            return
+
+        hdrs = _parse_mcp_scope_headers(scope)
+        _client = scope.get("client")
+        _client_host = _client[0] if _client else None
+        is_loopback_forward = settings.mcpgateway_session_affinity_enabled and _client_host in ("127.0.0.1", "::1") and hdrs.get("x-forwarded-internally") == "true"
+
+        if not is_loopback_forward:
+            _raw_origin: Optional[str] = hdrs.get("origin")
+            _raw_host: Optional[str] = hdrs.get("host")
+            if not _check_mcp_origin(_raw_origin):
+                logger.warning(
+                    "MCPOriginHostGate: rejecting request — invalid Origin: %s",
+                    sanitize_for_log(str(_raw_origin)),
+                )
+                await ORJSONResponse({"detail": "Forbidden: Origin not allowed"}, status_code=HTTP_403_FORBIDDEN)(scope, receive, send)
+                return
+            if not _check_mcp_host(_raw_host):
+                logger.warning(
+                    "MCPOriginHostGate: rejecting request — invalid Host: %s",
+                    sanitize_for_log(str(_raw_host)),
+                )
+                await ORJSONResponse({"detail": "Forbidden: Host not allowed"}, status_code=HTTP_403_FORBIDDEN)(scope, receive, send)
+                return
+
+        await self._app(scope, receive, send)
 
 
 def _maybe_open_initialize_span(body: bytes, *, mcp_session_id: Optional[str], server_id: Optional[str]) -> Optional[ContextManager[Any]]:
@@ -323,8 +463,15 @@ class ContextForgeMCPServer(Server[Any]):
         *,
         protocol_version: Optional[str] = None,
     ) -> types.ServerCapabilities:
-        """Return SDK capabilities plus enabled ContextForge MCP extensions."""
+        """Return SDK capabilities plus enabled ContextForge MCP extensions.
+
+        Modern protocol versions omit the logging capability. MCP 2026-07-28
+        deprecates it (SEP-2577), and ContextForge sends no request-scoped logs.
+        The SDK derives it from the legacy ``logging/setLevel`` handler only.
+        """
         capabilities = super().get_capabilities(notification_options, experimental_capabilities, extensions, protocol_version=protocol_version)
+        if protocol_version in MODERN_PROTOCOL_VERSIONS:
+            capabilities.logging = None
         user_context = user_context_var.get()
         extra_extensions = build_mcp_apps_capabilities(authorized=bool(user_context))
         if extra_extensions:
@@ -335,7 +482,7 @@ class ContextForgeMCPServer(Server[Any]):
         return capabilities
 
 
-mcp_app: Server[Any] = ContextForgeMCPServer("mcp-streamable-http")
+mcp_app: Server[Any] = ContextForgeMCPServer(settings.app_name, version=__version__)
 
 # ============================================================================
 # MCP v1 → v2 migration notes
@@ -369,6 +516,9 @@ server_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("server_id",
 from mcpgateway.transports.context import request_headers_var, user_context_var, user_identity_var  # noqa: E402  # pylint: disable=wrong-import-position
 
 _oauth_checked_var: contextvars.ContextVar[bool] = contextvars.ContextVar("_oauth_checked", default=False)
+# Server scope of the request being served, as resolved by _get_request_context_or_default();
+# the modern-path list/discover adapters read it to size ttlMs. None when unscoped.
+_request_server_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("request_server_id", default=None)
 
 
 class OAuthAuthResult(Enum):
@@ -417,9 +567,6 @@ def _resolve_authorization_servers(oauth_config: Dict[str, Any]) -> List[str]:
 
 
 _shared_session_registry: Optional[Any] = None
-_rust_event_store_client: Optional[httpx.AsyncClient] = None
-_rust_event_store_client_lock = asyncio.Lock()
-_RUST_EVENT_STORE_DEFAULT_KEY_PREFIX = "mcpgw:eventstore"
 
 # ------------------------------ Event store ------------------------------
 
@@ -716,128 +863,6 @@ class InMemoryEventStore(EventStore):
             await send_callback(EventMessage(entry.message, entry.event_id))
 
         return last_event.stream_id
-
-
-class RustEventStore(EventStore):
-    """Rust-backed event store that delegates resumable stream state to the sidecar."""
-
-    def __init__(self, max_events_per_stream: int = 100, ttl: int = 3600, key_prefix: str = _RUST_EVENT_STORE_DEFAULT_KEY_PREFIX):
-        """Initialize the Rust-backed event store wrapper.
-
-        Args:
-            max_events_per_stream: Maximum number of events retained per stream.
-            ttl: Event retention time in seconds.
-            key_prefix: Redis key prefix shared with the Rust sidecar.
-        """
-        self.max_events_per_stream = max_events_per_stream
-        self.ttl = ttl
-        self.key_prefix = key_prefix.rstrip(":")
-
-    async def store_event(self, stream_id: StreamId, message: JSONRPCMessage | None) -> EventId:
-        """Store an event in the Rust-backed resumable event store.
-
-        Args:
-            stream_id: Stream that owns the event.
-            message: JSON-RPC payload to persist for replay.
-
-        Returns:
-            The generated event identifier returned by the Rust sidecar.
-
-        Raises:
-            RuntimeError: If the Rust sidecar event store is unavailable or returns invalid data.
-        """
-        client = await _get_rust_event_store_client()
-        message_dict = None if message is None else (message.model_dump() if hasattr(message, "model_dump") else dict(message))
-        response = await client.post(
-            _build_rust_runtime_internal_url("/_internal/event-store/store"),
-            json={
-                "streamId": stream_id,
-                "message": message_dict,
-                "keyPrefix": self.key_prefix,
-                "maxEventsPerStream": self.max_events_per_stream,
-                "ttlSeconds": self.ttl,
-            },
-            timeout=httpx.Timeout(settings.experimental_rust_mcp_runtime_timeout_seconds),
-            follow_redirects=False,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        event_id = payload.get("eventId")
-        if not isinstance(event_id, str) or not event_id:
-            raise RuntimeError("Rust event store returned an invalid eventId")
-        return event_id
-
-    async def replay_events_after(self, last_event_id: EventId, send_callback: EventCallback) -> Union[StreamId, None]:
-        """Replay events newer than ``last_event_id`` through the provided callback.
-
-        Args:
-            last_event_id: Last event acknowledged by the reconnecting client.
-            send_callback: Callback invoked for each replayed event payload.
-
-        Returns:
-            The associated stream identifier when replay succeeds, else ``None``.
-        """
-        client = await _get_rust_event_store_client()
-        response = await client.post(
-            _build_rust_runtime_internal_url("/_internal/event-store/replay"),
-            json={
-                "lastEventId": last_event_id,
-                "keyPrefix": self.key_prefix,
-            },
-            timeout=httpx.Timeout(settings.experimental_rust_mcp_runtime_timeout_seconds),
-            follow_redirects=False,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        stream_id = payload.get("streamId")
-        if not isinstance(stream_id, str) or not stream_id:
-            return None
-        for event in payload.get("events", []):
-            if not isinstance(event, dict):
-                continue
-            await send_callback(event.get("message"))
-        return stream_id
-
-
-async def _get_rust_event_store_client() -> httpx.AsyncClient:
-    """Return the HTTP client used for Python -> Rust event-store calls.
-
-    Returns:
-        An async HTTP client configured for Rust event-store access.
-    """
-    global _rust_event_store_client  # pylint: disable=global-statement
-
-    uds_path = settings.experimental_rust_mcp_runtime_uds
-    if not uds_path:
-        return await get_http_client()
-
-    if _rust_event_store_client is not None:
-        return _rust_event_store_client
-
-    async with _rust_event_store_client_lock:
-        if _rust_event_store_client is None:
-            _rust_event_store_client = httpx.AsyncClient(
-                transport=httpx.AsyncHTTPTransport(uds=uds_path),
-                limits=get_http_limits(),
-                timeout=httpx.Timeout(settings.experimental_rust_mcp_runtime_timeout_seconds),
-                follow_redirects=False,
-            )
-        return _rust_event_store_client
-
-
-def _build_rust_runtime_internal_url(path: str) -> str:
-    """Build a Rust sidecar internal URL for UDS or loopback HTTP transport.
-
-    Args:
-        path: Internal Rust runtime path to append to the configured base URL.
-
-    Returns:
-        Absolute URL targeting the Rust sidecar over HTTP or UDS-backed transport.
-    """
-    base = urlsplit(settings.experimental_rust_mcp_runtime_url)
-    base_path = base.path.rstrip("/")
-    target_path = f"{base_path}{path}" if base_path else path
-    return urlunsplit((base.scheme, base.netloc, target_path, "", ""))
 
 
 # ------------------------------ Streamable HTTP Transport ------------------------------
@@ -1352,9 +1377,6 @@ async def _validate_streamable_session_access(
     if not _should_enforce_streamable_rbac(user_context):
         return True, 200, ""
 
-    if isinstance(user_context, dict) and user_context.get("_rust_session_validated") is True:
-        return True, 200, ""
-
     # Initialize establishes a new session and is authorized separately.
     if (rpc_method or "").strip() == "initialize":
         return True, 200, ""
@@ -1645,11 +1667,102 @@ async def _proxy_read_resource_to_gateway(gateway: Any, resource_uri: str, user_
                 content_result = await client.read_resource(resource_uri)
 
             logger.info("Received %s content items from gateway %s for resource %s", len(content_result.contents), gateway.id, resource_uri)
+            set_upstream_cache_directive(content_result)
             return content_result.contents
 
     except Exception as e:
         logger.exception("Error proxying resources/read to gateway %s for resource %s: %s", gateway.id, resource_uri, e)
         return []
+
+
+def _caller_is_modern() -> bool:
+    """True when the current request came over a 2026-era wire, where structuredContent may be any JSON value.
+
+    Returns:
+        bool: Whether the request's protocol version is a modern one.
+    """
+    return getattr(_v2_request_ctx.get(), "protocol_version", None) in MODERN_PROTOCOL_VERSIONS
+
+
+def _json_equal(left: Any, right: Any) -> bool:
+    """Compare two JSON values with their types kept apart: ``true`` is not ``1``, at any depth.
+
+    Args:
+        left: A parsed JSON value.
+        right: A parsed JSON value.
+
+    Returns:
+        bool: Whether both hold the same JSON.
+    """
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left is right
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(_json_equal(left[key], right[key]) for key in left)
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(_json_equal(a, b) for a, b in zip(left, right))
+    if isinstance(left, (dict, list)) or isinstance(right, (dict, list)):
+        return False
+    return left == right
+
+
+def text_content_carries(content: Any, value: Any) -> bool:
+    """True when a text block in ``content`` already holds ``value`` as JSON.
+
+    Args:
+        content: Content blocks, as dicts or content objects.
+        value: The JSON value to look for.
+
+    Returns:
+        bool: Whether some text block parses to exactly ``value``, booleans and numbers kept apart.
+    """
+    for block in content or []:
+        text = block.get("text") if isinstance(block, dict) else getattr(block, "text", None)
+        if not isinstance(text, str):
+            continue
+        try:
+            if _json_equal(orjson.loads(text), value):
+                return True
+        except orjson.JSONDecodeError:
+            continue
+    return False
+
+
+def _structured_for_caller(unstructured: List[Any], structured: Any) -> Any:
+    """Return ``structured`` as the caller's wire allows: any JSON value on 2026, an object only on 2025.
+
+    A non-object is dropped for a 2025-era caller. Its data must stay reachable, so when no text
+    block already carries it, one holding its JSON is appended to ``unstructured``.
+
+    Args:
+        unstructured: The result's content blocks; may gain a text block.
+        structured: The structuredContent value produced for the result.
+
+    Returns:
+        Any: The value to put on the wire, or None when the caller's era cannot carry it.
+    """
+    if structured is None or isinstance(structured, dict) or _caller_is_modern():
+        return structured
+    if not text_content_carries(unstructured, structured):
+        unstructured.append(types.TextContent(type="text", text=orjson.dumps(structured).decode()))
+    return None
+
+
+def _tools_for_caller(tools: List["types.Tool"]) -> List["types.Tool"]:
+    """Return the catalog as the caller's wire allows: a 2025-era caller may only see object output schemas.
+
+    The 2025 wire rejects a tool whose ``outputSchema`` is not an object schema, which would break
+    the whole ``tools/list``. Such a schema is omitted for that caller; its results arrive without
+    ``structuredContent`` anyway, so nothing is promised that the wire cannot carry.
+
+    Args:
+        tools: The tools the gateway would advertise.
+
+    Returns:
+        List[types.Tool]: The same tools, with non-object output schemas removed for a 2025-era caller.
+    """
+    if _caller_is_modern():
+        return tools
+    return [tool.model_copy(update={"output_schema": None}) if isinstance(tool.output_schema, dict) and tool.output_schema.get("type") != "object" else tool for tool in tools]
 
 
 def _truthy_is_error(result: Any) -> bool:
@@ -1997,8 +2110,7 @@ async def call_tool(
                 structured = result_data.get("structuredContent")
                 if structured is None:
                     structured = result_data.get("structured_content")
-                if not isinstance(structured, dict):
-                    structured = None
+                structured = _structured_for_caller(unstructured, structured)
                 is_error = bool(result_data.get("isError") or result_data.get("is_error"))
                 if is_error:
                     # Preserve the upstream error payload verbatim (#4202). Wrap
@@ -2008,10 +2120,12 @@ async def call_tool(
                     # and doesn't clobber the message with "Output validation
                     # error: outputSchema defined but no structured output
                     # returned".
+                    forwarded_meta = result_data.get("_meta")
                     return types.CallToolResult(
                         content=unstructured,
                         structured_content=structured,
                         is_error=True,
+                        _meta=forwarded_meta if isinstance(forwarded_meta, dict) else None,
                     )
                 # Success path: return the list/tuple shape so the MCP SDK's
                 # server-side validator runs and enforces the tool's
@@ -2047,7 +2161,8 @@ async def call_tool(
                 plugin_global_context=plugin_global_context,
                 plugin_context_table=plugin_context_table,
             )
-            if not result or not result.content:
+            # A result may carry its data only in structuredContent; only an empty result on both counts is "no content".
+            if not result or (not result.content and not isinstance(getattr(result, "structured_content", None), (dict, list, str, int, float, bool))):
                 logger.warning("No content returned by tool: %s", name)
                 return []
 
@@ -2150,17 +2265,17 @@ async def call_tool(
                 structured = None
 
             # Fallback to by-alias dump (in case the result is a pydantic model with alias fields)
-            if not isinstance(structured, dict):
+            if structured is None:
                 try:
                     dump = result.model_dump(by_alias=True) if hasattr(result, "model_dump") else {}
                     structured = dump.get("structuredContent") if isinstance(dump, dict) else None
                 except Exception:
                     structured = None
 
-            # MCP CallToolResult.structuredContent accepts dict or None only;
-            # reject anything else (e.g. stray MagicMocks in tests, bad shapes).
-            if not isinstance(structured, dict):
+            # Only JSON values travel: anything else (e.g. a stray MagicMock in tests) is dropped.
+            if not isinstance(structured, (dict, list, str, int, float, bool, type(None))):
                 structured = None
+            structured = _structured_for_caller(unstructured, structured)
 
             is_error = _truthy_is_error(result)
 
@@ -2172,10 +2287,12 @@ async def call_tool(
                 # and doesn't clobber the message with "Output validation
                 # error: outputSchema defined but no structured output
                 # returned".
+                result_meta = _convert_meta(getattr(result, "meta", None))
                 return types.CallToolResult(
                     content=unstructured,
                     structured_content=structured,
                     is_error=True,
+                    _meta=result_meta if isinstance(result_meta, dict) else None,
                 )
 
             # Success path: return the list/tuple shape so the MCP SDK's
@@ -2206,7 +2323,7 @@ async def call_tool(
         raise
 
 
-async def _get_request_context_or_default() -> Tuple[str, dict[str, Any], dict[str, Any]]:
+async def _resolve_request_context() -> Tuple[str, dict[str, Any], dict[str, Any]]:
     """Retrieves request context information for the current execution.
 
     This function resolves request context using the following precedence:
@@ -2338,6 +2455,17 @@ async def _get_request_context_or_default() -> Tuple[str, dict[str, Any], dict[s
     except Exception as e:
         logger.exception("Error recovering context in stateful session: %s", e)
         return s_id, request_headers_var.get(), user_context_var.get()
+
+
+async def _get_request_context_or_default() -> Tuple[str, dict[str, Any], dict[str, Any]]:
+    """Resolve the request context and remember its server scope for the modern-path adapters.
+
+    Returns:
+        Tuple[str, dict[str, Any], dict[str, Any]]: ``(server_id, request_headers, user_context)``.
+    """
+    server_id, request_headers, user_context = await _resolve_request_context()
+    _request_server_id_var.set(server_id if server_id and server_id != "default_server_id" else None)
+    return server_id, request_headers, user_context
 
 
 async def _resolve_jwt_user_email_for_streamable(payload: dict[str, Any]) -> str | None:
@@ -2793,6 +2921,12 @@ async def get_prompt(prompt_id: str, arguments: dict[str, str] | None = None) ->
             except PromptNotFoundError as e:
                 logger.info("Unknown prompt requested: %s", prompt_id)
                 raise MCPError(code=types.INVALID_PARAMS, message=f"Unknown prompt: {prompt_id}") from e
+            except PromptValidationError as e:
+                logger.info("Prompt %s refused the arguments: %s", prompt_id, e)
+                raise MCPError(code=types.INVALID_PARAMS, message=str(e)) from e
+            except PromptUpstreamError as e:
+                logger.info("Upstream answered prompt %s with JSON-RPC error %s", prompt_id, e.code)
+                raise MCPError(code=e.code, message=str(e), data=e.data) from e
             if not result or not result.messages:
                 logger.warning("No content returned by prompt: %s", prompt_id)
                 return types.GetPromptResult(messages=[])
@@ -2932,6 +3066,7 @@ async def read_resource(resource_uri: str) -> Union[str, bytes, List[Any]]:
         >>> sig.return_annotation
         typing.Union[str, bytes, typing.List[typing.Any]]
     """
+    upstream_read_cache_var.set(None)  # only an upstream read made during this call may set it
     server_id, request_headers, user_context = await _get_request_context_or_default()
 
     # Token scope cap: deny early if scoped permissions exclude resources.read
@@ -3182,6 +3317,7 @@ async def complete(
     ref: Union[types.PromptReference, types.ResourceTemplateReference],
     argument: types.CompleteRequest,
     context: Optional[types.CompletionContext] = None,
+    meta: Optional[types.RequestParamsMeta] = None,
 ) -> types.CompleteResult:
     """
     Provides argument completion suggestions for prompts or resources.
@@ -3193,6 +3329,7 @@ async def complete(
             position for which completion suggestions should be generated.
         context: Optional contextual information for the completion request,
             such as user, environment, or invocation metadata.
+        meta: Optional MCP request metadata.
 
     Returns:
         types.CompleteResult: A normalized completion result containing
@@ -3210,6 +3347,13 @@ async def complete(
     # Token scope cap: deny early if scoped permissions exclude tools.read
     if _should_enforce_streamable_rbac(user_context):
         if not _check_scoped_permission(user_context, "tools.read"):
+            raise PermissionError(_ACCESS_DENIED_MSG)
+        has_permission = await _check_streamable_permission(
+            user_context=user_context,
+            permission="tools.read",
+            check_any_team=_check_any_team_for_server_scoped_rbac(user_context, server_id),
+        )
+        if not has_permission:
             raise PermissionError(_ACCESS_DENIED_MSG)
 
     # Enforce per-server OAuth requirement in permissive mode (defense-in-depth).
@@ -3234,6 +3378,8 @@ async def complete(
                 "argument": argument.model_dump() if hasattr(argument, "model_dump") else argument,
                 "context": context.model_dump() if hasattr(context, "model_dump") else context,
             }
+            if meta is not None:
+                params["_meta"] = meta.model_dump(by_alias=True) if hasattr(meta, "model_dump") else meta
 
             result = await completion_service.handle_completion(
                 db,
@@ -3274,6 +3420,13 @@ async def complete(
             # Fallback: return empty completion
             return types.CompleteResult(completion=types.Completion(values=[], total=0, hasMore=False))
 
+    except CompletionError as e:
+        # Surface as an MCPError instead of a silently-empty CompleteResult,
+        # matching the JSON-RPC code #6629 requires (spec §8.5). This is a
+        # deliberate behavior change: today this path fails open (the caller
+        # gets a *successful* empty completion) — a federated-forwarding
+        # failure is now visible as a proper JSON-RPC error instead.
+        raise MCPError(code=completion_error_code(e), message=str(e)) from e
     except Exception as e:
         logger.exception("Error handling completion: %s", e)
         return types.CompleteResult(completion=types.Completion(values=[], total=0, hasMore=False))
@@ -3319,12 +3472,78 @@ if not hasattr(type(mcp_app), "request_context"):
     type(mcp_app).request_context = property(lambda _self: _get_v2_ctx())  # type: ignore[attr-defined]
 
 
+def _upstream_refresh_seconds(override: Optional[int]) -> int:
+    """Seconds between re-syncs of an upstream: its own interval (or the global default), never faster than the health-check interval that drives refreshes.
+
+    Args:
+        override: The upstream's ``refresh_interval_seconds``, or None.
+
+    Returns:
+        int: Seconds.
+    """
+    interval = override if override is not None else settings.gateway_auto_refresh_interval
+    return max(int(settings.health_check_interval), int(interval))
+
+
+async def _catalog_ttl_ms(server_id: Optional[str]) -> int:
+    """``ttlMs`` for a list: the shortest refresh interval among the upstreams feeding it (the global default when unscoped).
+
+    Args:
+        server_id: The virtual server the request is scoped to, or None.
+
+    Returns:
+        int: Milliseconds.
+    """
+    if server_id:
+        try:
+            # One statement: the distinct refresh intervals of every upstream behind the
+            # server's tools, resources and prompts, through the association tables; no
+            # tool/resource/prompt objects are loaded.
+            upstream_ids = union(
+                select(DbTool.gateway_id).join(server_tool_association, server_tool_association.c.tool_id == DbTool.id).where(server_tool_association.c.server_id == server_id),
+                select(DbResource.gateway_id).join(server_resource_association, server_resource_association.c.resource_id == DbResource.id).where(server_resource_association.c.server_id == server_id),
+                select(DbPrompt.gateway_id).join(server_prompt_association, server_prompt_association.c.prompt_id == DbPrompt.id).where(server_prompt_association.c.server_id == server_id),
+            )
+            async with get_db() as db:
+                intervals = db.execute(select(DbGateway.refresh_interval_seconds).distinct().where(DbGateway.id.in_(upstream_ids))).scalars().all()
+            if intervals:
+                return min(_upstream_refresh_seconds(interval) for interval in intervals) * 1000
+        except Exception:  # noqa: BLE001 — the TTL is advisory; never fail a list over it
+            # Nothing verifiable about the catalog's freshness: tell the client not to cache.
+            logger.warning("Could not derive the catalog TTL for server %s; answering ttlMs=0", server_id, exc_info=True)
+            return 0
+    return _upstream_refresh_seconds(None) * 1000
+
+
+async def _adapt_discover_with_ttl_cache_scope(ctx: Any, params: Any = None) -> "types.DiscoverResult":
+    """``server/discover`` with the cache directive set: the SDK's default answer plus ttlMs (catalog TTL) and cacheScope=private.
+
+    Args:
+        ctx: SDK request context.
+        params: Request params (unused by the default handler).
+
+    Returns:
+        types.DiscoverResult: The SDK's discover result carrying the cache directive.
+    """
+    token = _v2_request_ctx.set(ctx)
+    try:
+        # Resolve the request like the list handlers do, so a discover aimed at a
+        # virtual server gets that server's TTL rather than the global default.
+        await _get_request_context_or_default()
+        result = await mcp_app._handle_discover(ctx, params)  # pylint: disable=protected-access  # the SDK's documented default, overridden here only to add the directive
+        result.ttl_ms = await _catalog_ttl_ms(_request_server_id_var.get())
+        result.cache_scope = "private"
+        return result
+    finally:
+        _v2_request_ctx.reset(token)
+
+
 async def _adapt_list_tools(ctx: Any, _params: Any = None) -> "types.ListToolsResult":
     """v2 (ctx, params) -> v1 list_tools() -> ListToolsResult."""
     token = _v2_request_ctx.set(ctx)
     try:
-        tools = await list_tools()
-        return types.ListToolsResult(tools=tools)
+        tools = _tools_for_caller(await list_tools())
+        return types.ListToolsResult(tools=tools, ttl_ms=await _catalog_ttl_ms(_request_server_id_var.get()), cache_scope="private")
     finally:
         _v2_request_ctx.reset(token)
 
@@ -3357,7 +3576,7 @@ async def _adapt_list_prompts(ctx: Any, _params: Any = None) -> "types.ListPromp
     token = _v2_request_ctx.set(ctx)
     try:
         prompts = await list_prompts()
-        return types.ListPromptsResult(prompts=prompts)
+        return types.ListPromptsResult(prompts=prompts, ttl_ms=await _catalog_ttl_ms(_request_server_id_var.get()), cache_scope="private")
     finally:
         _v2_request_ctx.reset(token)
 
@@ -3366,7 +3585,8 @@ async def _adapt_get_prompt(ctx: Any, params: Any) -> "types.GetPromptResult":
     """v2 (ctx, params) -> v1 get_prompt(prompt_id, arguments) -> GetPromptResult."""
     token = _v2_request_ctx.set(ctx)
     try:
-        return await get_prompt(params.name, params.arguments)
+        # Over MCP a call without arguments still asks for a rendered prompt, so required arguments are checked.
+        return await get_prompt(params.name, params.arguments or {})
     finally:
         _v2_request_ctx.reset(token)
 
@@ -3376,7 +3596,7 @@ async def _adapt_list_resources(ctx: Any, _params: Any = None) -> "types.ListRes
     token = _v2_request_ctx.set(ctx)
     try:
         resources = await list_resources()
-        return types.ListResourcesResult(resources=resources)
+        return types.ListResourcesResult(resources=resources, ttl_ms=await _catalog_ttl_ms(_request_server_id_var.get()), cache_scope="private")
     finally:
         _v2_request_ctx.reset(token)
 
@@ -3392,8 +3612,12 @@ async def _adapt_read_resource(ctx: Any, params: Any) -> "types.ReadResourceResu
     try:
         uri = str(params.uri)
         result = await read_resource(uri)
+        # Relay the upstream's cache directive when an upstream was read; content served
+        # from the DB gets the SDK defaults (ttlMs 0) with the scope set explicitly.
+        upstream_cache_directive = upstream_read_cache_var.get() or {}
+        cache = {"ttl_ms": upstream_cache_directive.get("ttl_ms", 0), "cache_scope": upstream_cache_directive.get("cache_scope", "private")}
         if isinstance(result, list):
-            return types.ReadResourceResult(contents=result)
+            return types.ReadResourceResult(contents=result, **cache)
         if isinstance(result, bytes):
             return types.ReadResourceResult(
                 contents=[
@@ -3401,9 +3625,10 @@ async def _adapt_read_resource(ctx: Any, params: Any) -> "types.ReadResourceResu
                         uri=uri,
                         blob=base64.b64encode(result).decode("utf-8"),
                     )
-                ]
+                ],
+                **cache,
             )
-        return types.ReadResourceResult(contents=[types.TextResourceContents(uri=uri, text=str(result))])
+        return types.ReadResourceResult(contents=[types.TextResourceContents(uri=uri, text=str(result))], **cache)
     finally:
         _v2_request_ctx.reset(token)
 
@@ -3417,7 +3642,7 @@ async def _adapt_list_resource_templates(ctx: Any, _params: Any = None) -> "type
     try:
         raw_templates = await list_resource_templates()
         templates = [types.ResourceTemplate.model_validate(t) if isinstance(t, dict) else t for t in raw_templates]
-        return types.ListResourceTemplatesResult(resourceTemplates=templates)
+        return types.ListResourceTemplatesResult(resourceTemplates=templates, ttl_ms=await _catalog_ttl_ms(_request_server_id_var.get()), cache_scope="private")
     finally:
         _v2_request_ctx.reset(token)
 
@@ -3427,13 +3652,14 @@ async def _adapt_complete(ctx: Any, params: Any) -> "types.CompleteResult":
     token = _v2_request_ctx.set(ctx)
     try:
         completion_context = getattr(params, "context", None)
-        return await complete(params.ref, params.argument, completion_context)
+        return await complete(params.ref, params.argument, completion_context, getattr(params, "meta", None))
     finally:
         _v2_request_ctx.reset(token)
 
 
 # Register all handlers via the v2 add_request_handler API. set_logging_level
 # was already migrated to (_ctx, params) form so it registers directly.
+mcp_app.add_request_handler("server/discover", types.RequestParams, _adapt_discover_with_ttl_cache_scope)
 mcp_app.add_request_handler("tools/list", types.PaginatedRequestParams, _adapt_list_tools)
 mcp_app.add_request_handler("tools/call", types.CallToolRequestParams, _adapt_call_tool)
 mcp_app.add_request_handler("prompts/list", types.PaginatedRequestParams, _adapt_list_prompts)
@@ -4322,14 +4548,8 @@ class SessionManagerWrapper:
         """
 
         if settings.use_stateful_sessions:
-            if settings.experimental_rust_mcp_runtime_enabled and settings.experimental_rust_mcp_session_auth_reuse_enabled and settings.experimental_rust_mcp_event_store_enabled:
-                event_store = RustEventStore(
-                    max_events_per_stream=settings.streamable_http_max_events_per_stream,
-                    ttl=settings.streamable_http_event_ttl,
-                )
-                logger.debug("Using RustEventStore for stateful sessions")
             # Use Redis event store for single-worker stateful deployments
-            elif settings.cache_type == "redis" and settings.redis_url:
+            if settings.cache_type == "redis" and settings.redis_url:
                 event_store = RedisEventStore(max_events_per_stream=settings.streamable_http_max_events_per_stream, ttl=settings.streamable_http_event_ttl)
                 logger.debug("Using RedisEventStore for stateful sessions (single-worker)")
             else:
@@ -4472,16 +4692,16 @@ class SessionManagerWrapper:
         match = _SERVER_ID_RE.search(path)
 
         # Extract request headers from scope (ASGI provides bytes; normalize to lowercase for lookup).
-        raw_headers = scope.get("headers") or []
-        headers: dict[str, str] = {}
-        for item in raw_headers:
-            if not isinstance(item, (tuple, list)) or len(item) != 2:
-                continue
-            k, v = item
-            if not isinstance(k, (bytes, bytearray)) or not isinstance(v, (bytes, bytearray)):
-                continue
-            # latin-1 is a byte-preserving decode; safe for arbitrary header bytes.
-            headers[k.decode("latin-1").lower()] = v.decode("latin-1")
+        headers = _parse_mcp_scope_headers(scope)
+
+        # Internal-forward bypass: only valid when session-affinity is enabled (the sole code path
+        # that sets x-forwarded-internally). Gate on loopback source to prevent external spoofing.
+        # Origin/Host checks are enforced at the /mcp mount level (main.py MCPOriginHostGate) so
+        # that all ingress shapes — Python, rust-internal, and rust-public — are covered by a single
+        # gate without duplicating the logic here.
+        _client = scope.get("client")
+        _client_host = _client[0] if _client else None
+        is_internally_forwarded = settings.mcpgateway_session_affinity_enabled and _client_host in ("127.0.0.1", "::1") and headers.get("x-forwarded-internally") == "true"
 
         # Log session info for debugging stateful sessions
         mcp_session_id = headers.get("x-mcp-session-id") or headers.get("mcp-session-id") or "not-provided"
@@ -4497,11 +4717,6 @@ class SessionManagerWrapper:
 
         # Multi-worker session affinity: check if we should forward to another worker
         # This must happen BEFORE the SDK's session manager handles the request
-        # Only trust x-forwarded-internally from loopback to prevent external spoofing
-        _client = scope.get("client")
-        _client_host = _client[0] if _client else None
-        _from_loopback = _client_host in ("127.0.0.1", "::1") if _client_host else False
-        is_internally_forwarded = _from_loopback and headers.get("x-forwarded-internally") == "true"
 
         if settings.mcpgateway_session_affinity_enabled and mcp_session_id != "not-provided":
             try:
@@ -5353,9 +5568,9 @@ async def _set_proxy_user_context(proxy_user: str) -> dict[str, Any] | None:
 def get_streamable_http_auth_context() -> dict[str, Any]:
     """Return the current StreamableHTTP auth context for trusted internal forwarding.
 
-    The Rust MCP proxy uses this to carry already-authenticated MCP request context
-    across the Python -> Rust -> Python seam so the internal dispatcher does not
-    need to repeat JWT verification and team normalization on the hot path.
+    Trusted internal dispatch uses this to carry already-authenticated MCP request
+    context so the internal dispatcher does not need to repeat JWT verification and
+    team normalization on the hot path.
 
     Returns:
         A shallow copy of the trusted auth context fields that may be forwarded
@@ -5587,7 +5802,6 @@ class _StreamableHttpAuthHandler:
 
             # First-Party
             from mcpgateway.auth import _get_auth_context_batched_sync, resolve_trace_team_name  # pylint: disable=import-outside-toplevel
-            from mcpgateway.auth_context import jwt_subject_is_uuid  # pylint: disable=import-outside-toplevel
             from mcpgateway.cache.auth_cache import CachedAuthContext, get_auth_cache  # pylint: disable=import-outside-toplevel
 
             jti = user_payload.get("jti")

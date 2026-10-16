@@ -227,8 +227,29 @@ async def test_import_configuration_conflict_update(import_service, mock_db, val
     assert status.status == "completed"
     assert status.updated_entities == 2
 
-    # Verify update calls were made for gateway
+    # Verify update calls were made for gateway, with the importer identity arming the ownership guard
     import_service.gateway_service.update_gateway.assert_called_once()
+    assert import_service.gateway_service.update_gateway.call_args.kwargs["user_email"] == "test_user"
+
+    # Bulk paths receive the importer identity so ownership is enforced on update
+    assert import_service.tool_service.register_tools_bulk.call_args.kwargs["user_email"] == "test_user"
+
+
+@pytest.mark.asyncio
+async def test_import_passes_importer_identity_to_resource_and_prompt_bulk(import_service, mock_db):
+    """Resource and prompt bulk imports carry the importer identity for ownership checks."""
+    import_data = {
+        "version": "2025-03-26",
+        "exported_at": "2025-01-01T00:00:00Z",
+        "entities": {
+            "resources": [{"name": "r", "uri": "file:///r.txt", "description": "d", "mime_type": "text/plain"}],
+            "prompts": [{"name": "p", "template": "Hello", "description": "d", "arguments": []}],
+        },
+    }
+    await import_service.import_configuration(db=mock_db, import_data=import_data, conflict_strategy=ConflictStrategy.UPDATE, imported_by="importer@example.com")
+
+    assert import_service.resource_service.register_resources_bulk.call_args.kwargs["user_email"] == "importer@example.com"
+    assert import_service.prompt_service.register_prompts_bulk.call_args.kwargs["user_email"] == "importer@example.com"
 
 
 @pytest.mark.asyncio
@@ -826,7 +847,8 @@ async def test_import_configuration_general_exception_handling(import_service, m
     with pytest.raises(ImportError) as excinfo:
         await import_service.import_configuration(db=mock_db, import_data=valid_import_data, imported_by="test_user")
 
-    assert "Import failed: Validation failed unexpectedly" in str(excinfo.value)
+    assert "Import failed: An unexpected error occurred" in str(excinfo.value)
+    assert "Validation failed unexpectedly" not in str(excinfo.value)
 
 
 @pytest.mark.asyncio

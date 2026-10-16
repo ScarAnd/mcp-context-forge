@@ -54,8 +54,26 @@ Stored as JSON within the gateway record and assembled from Admin UI fields or A
 - **Redirect URI**: Must match the OAuth client registration.
 - **Client Credentials**: Client ID and encrypted Client Secret.
 - **User Credentials**: Username and password (for password grant only).
+- **Token Endpoint Auth**: `token_endpoint_auth_method` (`client_secret_basic`, `client_secret_post`, `none`, or `private_key_jwt`), optional inline `private_key` PEM plus `token_endpoint_auth_signing_alg` and `private_key_jwt_kid` for private-key JWT authentication (RFC 7523). Default: client credentials posted in the request body.
 - **Scopes**: Array of requested scopes.
 - **Resource**: Optional resource parameter; derived from the gateway URL if omitted.
+
+### Private-Key JWT Client Authentication (RFC 7523)
+
+Gateways may authenticate to the token endpoint with a signed JWT instead of a shared client secret, as defined in [RFC 7523](https://datatracker.ietf.org/doc/html/rfc7523). This is the standard confidential-client method for providers such as Microsoft Entra ID and Keycloak that issue JWKS to verify client assertions.
+
+Configured on the `oauth_config` object:
+
+| Key | Required | Meaning |
+|-----|----------|---------|
+| `token_endpoint_auth_method` | no | `client_secret_basic`, `client_secret_post`, `none`, or `private_key_jwt`. Default: `client_secret_post` (client id and secret in the body). |
+| `private_key` | private_key_jwt only | Inline private key PEM used to sign the assertion. Rejected at validation when missing. |
+| `token_endpoint_auth_signing_alg` | no | JWS signing algorithm: `RS256`, `RS384`, `RS512`, `ES256`, `ES384`, `ES512`, or `PS256`. Default: `RS256`. |
+| `private_key_jwt_kid` | no | Key ID to emit as the JWT header `kid`, for provider JWKS matching. Omitted unless non-empty. |
+
+At token time the gateway builds a client assertion JWT with claims `iss`, `sub`, `aud` (the configured `token_url`), `iat`/`exp` (validity window capped at 300 seconds), and a random `jti`, then sends it with `client_assertion_type` set to `urn:ietf:params:oauth:client-assertion-type:jwt-bearer`. Signing runs without blocking the event loop.
+
+Fail-closed behavior: an unsupported `token_endpoint_auth_method`, an algorithm outside the allowlist, or a missing `private_key` for `private_key_jwt` raises `OAuthError` before any token request is sent. An unknown method and `private_key_jwt` never fall back to another auth method; `client_secret_basic` with a missing secret falls back to POST-body mode for public PKCE clients.
 
 ### OAuth Tokens
 
@@ -101,7 +119,7 @@ The gateway configuration form maps user inputs to the OAuth configuration struc
 
 ### Audience handling and RFC 8707
 
-The gateway implements [RFC 8707](https://datatools.ietf.org/doc/html/rfc8707) (Resource Indicators for OAuth 2.0) to ensure that access tokens are correctly scoped for the target MCP server.
+The gateway implements [RFC 8707](https://datatracker.ietf.org/doc/html/rfc8707) (Resource Indicators for OAuth 2.0) to ensure that access tokens are correctly scoped for the target MCP server.
 
 #### The `resource` parameter
 
@@ -245,12 +263,16 @@ RFC 8693 §2.2.1 requires the AS to return a `token_type` field. `OAuthManager.t
 
 ### Caching
 
-Exchanged tokens are cached (`TokenExchangeCache`, Redis-backed with an in-memory fallback) under a key derived from the gateway, user, and `target_audience`. Cache behavior:
+Exchanged tokens are cached (`TokenExchangeCache`, Redis-backed with an in-memory fallback) under an identity derived from the gateway, authenticated user, `target_audience`, and a SHA-256 digest of the exact subject JWT. The JWT itself is not part of the cache key. Repeated use of the same JWT can reuse its cached exchange; a different JWT receives a separate Authorization Server decision, even when it belongs to the same user. This binds cache entries to the credential that was exchanged.
 
 - **TTL**: Taken from the Authorization Server's `expires_in` response field.
-- **Single-flight**: Concurrent requests for the same cache key share one in-flight exchange instead of issuing duplicate calls to the AS.
-- **Negative caching**: A failed exchange is cached briefly so repeated failures don't hammer the AS; callers see a "token exchange unavailable" degraded-mode error until the cooldown expires.
-- **401 invalidation**: For REST-integration tool calls, if the downstream server rejects the exchanged token with `401`, the cache entry is evicted and exactly **one** re-exchange is attempted before failing. (MCP-protocol tool calls over SSE/streamable HTTP do not expose a retryable HTTP status and are out of scope for this retry.)
+- **Single-flight**: Concurrent requests with the same cache identity share one in-flight exchange. Different subject JWTs use separate locks and exchanges.
+- **Negative caching**: A failed exchange is cached briefly under the same credential-specific identity, so it does not affect another JWT for that user. Callers see a "token exchange unavailable" degraded-mode error until the cooldown expires.
+- **401 invalidation**: For REST-integration tool calls, if the downstream server rejects the exchanged token with `401`, only the matching credential-specific entry is evicted and exactly **one** re-exchange is attempted before failing. (MCP-protocol tool calls over SSE/streamable HTTP do not expose a retryable HTTP status and are out of scope for this retry.)
+
+The cache key format changed with this behavior. New workers do not read entries written with the previous key format. During a mixed-version rollout, old workers can continue using the previous cache identity, so deploy the update to every Python gateway worker and stop or drain old workers before considering the rollout complete. Old-format Redis entries expire through their existing TTLs; do not flush shared Redis data for this rollout. Rolling back to older code restores the previous cache behavior and allows it to read old-format entries.
+
+Credential-specific entries can increase Authorization Server requests when a user's JWT changes and increase cache cardinality. The existing bounded-memory eviction and Redis TTLs continue to apply. Per-process single-flight remains local to each process; it does not provide distributed locking across workers.
 
 ### Shared-Issuer Trust Requirement
 

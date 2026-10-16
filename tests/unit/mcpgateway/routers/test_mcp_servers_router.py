@@ -53,7 +53,7 @@ from tests.utils.rbac_mocks import patch_rbac_decorators, restore_rbac_decorator
 def rbac_bypass():
     """Bypass RBAC decorators for unit tests."""
     originals = patch_rbac_decorators()
-    yield
+    yield originals
     restore_rbac_decorators(originals)
 
 
@@ -769,7 +769,7 @@ async def test_handshake_discover_fallback_to_initialize(handshake_request, user
     # The SDK keeps the validated hostname; _SniPinningTransport dials the pinned address.
     assert mock_streamable.call_args.kwargs["url"] == "http://example.com/mcp"
     assert mock_transport.call_args.kwargs["sni_hostname"] == "example.com"
-    assert mock_transport.call_args.kwargs["pinned_host"] == "8.8.8.8"
+    assert mock_transport.call_args.kwargs["pinned_hosts"] == ["8.8.8.8"]
 
 
 @pytest.mark.asyncio
@@ -924,6 +924,10 @@ def _mock_gateway(**attributes):
     gateway.auth_value = None
     gateway.oauth_config = None
     gateway.ca_certificate = None
+    gateway.client_cert = None
+    gateway.client_key = None
+    gateway.transport = "STREAMABLEHTTP"
+    gateway.url = "http://example.com"
     for key, value in attributes.items():
         setattr(gateway, key, value)
     return gateway
@@ -1197,7 +1201,7 @@ async def test_handshake_sse_gateway_uses_sse_client(handshake_request, user_ctx
             await factory_client.aclose()
 
     assert mock_transport.call_args.kwargs["sni_hostname"] == "example.com"
-    assert mock_transport.call_args.kwargs["pinned_host"] == "8.8.8.8"
+    assert mock_transport.call_args.kwargs["pinned_hosts"] == ["8.8.8.8"]
 
 
 @pytest.mark.asyncio
@@ -1331,6 +1335,178 @@ async def test_handshake_form_header_replaces_stored_header_of_different_case(us
     sent_headers = mock_client.request.call_args.kwargs["headers"]
     assert sent_headers["x-api-key"] == "typed-key"
     assert "X-API-Key" not in sent_headers
+
+
+def test_handshake_candidate_only_requires_gateway_id():
+    """Candidate-only validation rejects URL-only gateway selection."""
+    with pytest.raises(ValueError, match="gateway_id is required"):
+        GatewayHandshakeRequest(
+            base_url="http://example.com",
+            headers={"X-Api-Key": "candidate"},  # pragma: allowlist secret
+            credential_mode="candidate_only",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("configure_allowlist")
+async def test_handshake_candidate_only_uses_exact_gateway_without_stored_headers(user_ctx, team_b_gateway_db, monkeypatch):
+    """Candidate-only validation selects the requested gateway and excludes its stored credentials."""
+    from mcpgateway import config
+
+    monkeypatch.setattr(config.settings, "platform_admin_email", "admin@example.com")
+    db = team_b_gateway_db(visibility="public")
+    request = GatewayHandshakeRequest(
+        gateway_id="gw-team-b",
+        base_url="http://example.com",
+        path="/mcp",
+        headers={"Api-Key": "candidate"},  # pragma: allowlist secret
+        credential_mode="candidate_only",
+    )
+    mock_client = _mock_resilient_client(_discover_success())
+
+    with patch("mcpgateway.services.gateway_service.ResilientHttpClient", return_value=mock_client):
+        result = await check_mcp_server_handshake(request=request, team_id=None, user=user_ctx, db=db)
+
+    assert result.success is True
+    assert result.credential_source == "form"
+    sent_headers = mock_client.request.call_args.kwargs["headers"]
+    assert sent_headers["Api-Key"] == "candidate"
+    assert "Authorization" not in sent_headers
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("configure_allowlist")
+async def test_handshake_candidate_only_uses_exact_gateway_when_visible_gateways_share_url(user_ctx, team_b_gateway_db, monkeypatch):
+    """Candidate-only validation selects the exact gateway without its stored credentials."""
+    from mcpgateway import config
+
+    monkeypatch.setattr(config.settings, "platform_admin_email", "admin@example.com")
+    db = team_b_gateway_db()
+    db.add(
+        DbGateway(
+            id="gw-public",
+            name="Public Server",
+            slug="public-server",
+            url="http://example.com",
+            transport="SSE",
+            capabilities={},
+            enabled=True,
+            auth_type="authheaders",
+            auth_value={"X-Public-Key": "stored-public"},
+            visibility="public",
+        )
+    )
+    db.commit()
+    request = GatewayHandshakeRequest(
+        gateway_id="gw-public",
+        base_url="http://example.com",
+        path="/mcp",
+        headers={"X-Candidate-Key": "candidate"},
+        credential_mode="candidate_only",
+    )
+    mock_client = _mock_resilient_client(_json_response(404, {"error": "not found"}))
+    _unused_cm, session = _mock_sdk_session()
+    sse_cm = MagicMock()
+    sse_cm.__aenter__ = AsyncMock(return_value=(MagicMock(), MagicMock()))
+    sse_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with patch("mcpgateway.services.gateway_service.ResilientHttpClient", return_value=mock_client):
+        with patch("mcpgateway.services.gateway_service.sse_client", return_value=sse_cm) as mock_sse:
+            with patch("mcpgateway.services.gateway_service.ClientSession", return_value=session):
+                result = await check_mcp_server_handshake(request=request, team_id=None, user=user_ctx, db=db)
+
+    assert result.success is True
+    assert result.credential_source == "form"
+    mock_sse.assert_called_once()
+    sent_headers = mock_sse.call_args.kwargs["headers"]
+    assert sent_headers == {"X-Candidate-Key": "candidate"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("configure_allowlist")
+async def test_handshake_exact_gateway_uses_stored_credentials_by_default(user_ctx, team_b_gateway_db, monkeypatch):
+    """Exact gateway selection retains stored credentials when credential mode is omitted."""
+    from mcpgateway import config
+
+    monkeypatch.setattr(config.settings, "platform_admin_email", "admin@example.com")
+    db = team_b_gateway_db(visibility="public")
+    request = GatewayHandshakeRequest(gateway_id="gw-team-b", base_url="http://example.com", path="/mcp")
+    mock_client = _mock_resilient_client(_discover_success())
+
+    with patch("mcpgateway.services.gateway_service.ResilientHttpClient", return_value=mock_client):
+        result = await check_mcp_server_handshake(request=request, team_id=None, user=user_ctx, db=db)
+
+    assert result.success is True
+    assert result.credential_source == "stored"
+    assert "Authorization" in mock_client.request.call_args.kwargs["headers"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("configure_allowlist")
+async def test_handshake_exact_gateway_url_mismatch_does_not_probe(user_ctx, team_b_gateway_db, monkeypatch):
+    """An exact gateway whose URL differs from the request cannot supply connection settings."""
+    from mcpgateway import config
+
+    monkeypatch.setattr(config.settings, "platform_admin_email", "admin@example.com")
+    db = team_b_gateway_db(visibility="public", url="http://other.example.com")
+    request = GatewayHandshakeRequest(
+        gateway_id="gw-team-b",
+        base_url="http://example.com",
+        headers={"X-Api-Key": "candidate"},  # pragma: allowlist secret
+        credential_mode="candidate_only",
+    )
+    mock_client = _mock_resilient_client()
+
+    with patch("mcpgateway.services.gateway_service.ResilientHttpClient", return_value=mock_client):
+        result = await check_mcp_server_handshake(request=request, team_id=None, user=user_ctx, db=db)
+
+    assert result.success is False
+    assert result.failure_class == "transport"
+    mock_client.request.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("configure_allowlist")
+async def test_handshake_exact_gateway_respects_visibility(narrowed_user, team_b_gateway_db):
+    """Exact selection does not let a team-A token access a team-B gateway."""
+    db = team_b_gateway_db()
+    request = GatewayHandshakeRequest(
+        gateway_id="gw-team-b",
+        base_url="http://example.com",
+        headers={"X-Api-Key": "candidate"},  # pragma: allowlist secret
+        credential_mode="candidate_only",
+    )
+    mock_client = _mock_resilient_client()
+
+    with patch("mcpgateway.services.gateway_service.ResilientHttpClient", return_value=mock_client):
+        result = await check_mcp_server_handshake(request=request, team_id=None, user=narrowed_user, db=db)
+
+    assert result.success is False
+    assert result.failure_class == "transport"
+    mock_client.request.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("configure_allowlist")
+async def test_handshake_candidate_only_skips_stored_oauth_token(user_ctx, db_session):
+    """Candidate-only validation does not resolve a registered gateway's stored OAuth token."""
+    db_session.execute.return_value.scalars.return_value.first.return_value = _mock_gateway(id="gateway-1", auth_type="oauth", oauth_config={"grant_type": "authorization_code"})
+    request = GatewayHandshakeRequest(
+        gateway_id="gateway-1",
+        base_url="http://example.com",
+        headers={"Authorization": "Bearer candidate"},
+        credential_mode="candidate_only",
+    )
+    mock_client = _mock_resilient_client(_discover_success())
+
+    with patch("mcpgateway.services.gateway_service.ResilientHttpClient", return_value=mock_client):
+        with patch("mcpgateway.services.token_storage_service.TokenStorageService") as token_storage:
+            result = await check_mcp_server_handshake(request=request, team_id=None, user=user_ctx, db=db_session)
+
+    assert result.success is True
+    assert result.credential_source == "form"
+    assert mock_client.request.call_args.kwargs["headers"]["Authorization"] == "Bearer candidate"
+    token_storage.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1580,13 +1756,19 @@ async def test_handshake_registered_only_allowlist_keeps_public_gateways_probeab
 @pytest.mark.asyncio
 async def test_sni_pinning_transport_dials_pinned_host_with_hostname_identity():
     """The transport rewrites the request onto the pinned address while keeping Host and TLS identity."""
-    transport = _SniPinningTransport(sni_hostname="example.com", pinned_host="8.8.8.8")
+    transport = _SniPinningTransport(sni_hostname="example.com", pinned_hosts=["8.8.8.8"])
     request = httpx2.Request("GET", "http://example.com/mcp")
+    dialled = []
 
-    with patch.object(httpx2.AsyncHTTPTransport, "handle_async_request", AsyncMock(return_value=httpx2.Response(200))):
+    async def _capture(req):
+        dialled.append(str(req.url))
+        return httpx2.Response(200)
+
+    with patch.object(httpx2.AsyncHTTPTransport, "handle_async_request", AsyncMock(side_effect=_capture)):
         await transport.handle_async_request(request)
 
-    assert str(request.url) == "http://8.8.8.8/mcp"
+    assert dialled == ["http://8.8.8.8/mcp"]
+    assert str(request.url) == "http://example.com/mcp"
     assert request.headers["Host"] == "example.com"
     assert request.extensions["sni_hostname"] == "example.com"
     await transport.aclose()
@@ -1595,7 +1777,7 @@ async def test_sni_pinning_transport_dials_pinned_host_with_hostname_identity():
 @pytest.mark.asyncio
 async def test_sni_pinning_transport_refuses_unvalidated_host():
     """The transport refuses to send anywhere but the validated hostname."""
-    transport = _SniPinningTransport(sni_hostname="example.com", pinned_host="8.8.8.8")
+    transport = _SniPinningTransport(sni_hostname="example.com", pinned_hosts=["8.8.8.8"])
     request = httpx2.Request("GET", "http://attacker.example.net/mcp")
 
     with pytest.raises(httpx2.UnsupportedProtocol):
@@ -1653,15 +1835,40 @@ async def test_handshake_uses_gateway_custom_ca_for_tls(user_ctx, db_session):
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("configure_allowlist")
+async def test_handshake_candidate_only_keeps_custom_ca_without_client_certificate(user_ctx, db_session):
+    """Candidate-only validation keeps server trust settings but excludes client credentials."""
+    gateway = _mock_gateway(id="gateway-1", url="https://example.com", ca_certificate="ca-pem", client_cert="client-pem", client_key="key-pem")
+    db_session.execute.return_value.scalars.return_value.first.return_value = gateway
+    request = GatewayHandshakeRequest(gateway_id="gateway-1", base_url="https://example.com", headers={}, credential_mode="candidate_only")
+    mock_client = _mock_resilient_client(_discover_success())
+    ssl_context = ssl.create_default_context()
+
+    with patch("mcpgateway.services.gateway_service.ResilientHttpClient", return_value=mock_client) as mock_resilient:
+        with patch("mcpgateway.services.gateway_service.get_cached_ssl_context", return_value=ssl_context) as mock_ssl:
+            result = await check_mcp_server_handshake(request=request, team_id=None, user=user_ctx, db=db_session)
+
+    assert result.success is True
+    mock_ssl.assert_called_once_with("ca-pem", client_cert=None, client_key=None)
+    assert mock_resilient.call_args.kwargs["client_args"]["verify"] is ssl_context
+
+
+@pytest.mark.asyncio
 async def test_sni_pinning_transport_accepts_punycode_host():
     """An internationalized hostname is matched in its IDNA-encoded form, not rejected."""
-    transport = _SniPinningTransport(sni_hostname="xn--nicode-2ya.com", pinned_host="8.8.8.8")
+    transport = _SniPinningTransport(sni_hostname="xn--nicode-2ya.com", pinned_hosts=["8.8.8.8"])
     request = httpx2.Request("GET", "http://xn--nicode-2ya.com/mcp")
+    dialled = []
 
-    with patch.object(httpx2.AsyncHTTPTransport, "handle_async_request", AsyncMock(return_value=httpx2.Response(200))):
+    async def _capture(req):
+        dialled.append(str(req.url))
+        return httpx2.Response(200)
+
+    with patch.object(httpx2.AsyncHTTPTransport, "handle_async_request", AsyncMock(side_effect=_capture)):
         await transport.handle_async_request(request)
 
-    assert str(request.url) == "http://8.8.8.8/mcp"
+    assert dialled == ["http://8.8.8.8/mcp"]
+    assert str(request.url) == "http://xn--nicode-2ya.com/mcp"
     await transport.aclose()
 
 
@@ -1854,13 +2061,14 @@ async def test_handshake_matches_registered_root_url_with_query_string(team_b_ga
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("configure_allowlist")
-async def test_handshake_legacy_mode_skips_discover_uses_initialize(handshake_request, user_ctx, db_session):
+async def test_handshake_legacy_mode_skips_discover_uses_initialize(handshake_request, user_ctx, db_session, monkeypatch):
     """In legacy mode the server/discover probe is not attempted; SDK initialize runs directly.
 
     This is the mirror of test_handshake_discover_success and covers the acceptance criterion
     in issue #6767: mcp_client_connect_mode='legacy' must bypass the stateless discover probe
     entirely and report negotiation_path='initialize'.
     """
+    monkeypatch.setattr("mcpgateway.config.settings.mcp_client_connect_mode", "legacy")
     db_session.execute.return_value.scalars.return_value.first.return_value = None
 
     # No discover responses queued — the probe must not fire.
@@ -1878,3 +2086,212 @@ async def test_handshake_legacy_mode_skips_discover_uses_initialize(handshake_re
     assert result.negotiation_path == "initialize"
     # The discover probe must have been skipped entirely.
     mock_resilient.request.assert_not_called()
+
+
+# Tests: POST /v1/mcp-servers/test-handshake — HTTP-stack (black-box) coverage
+#
+# These tests drive requests through the real FastAPI ASGI app so that
+# FastAPI validation and the @require_permission decorator are exercised,
+# not just the handler function.
+#
+# SQLite note: TestClient runs the ASGI app in a separate thread.  The
+# sessions yielded by the db override must therefore come from an engine
+# created with check_same_thread=False and StaticPool so they survive
+# cross-thread use.  Each test builds its own engine + session factory.
+# ---------------------------------------------------------------------------
+
+
+def _make_handshake_app(session_factory, user_ctx, rbac_originals):
+    """Mount the real mcp_servers router on a throwaway FastAPI app.
+
+    ``session_factory`` is called per-request inside the DB override so each
+    TestClient thread gets a fresh, thread-safe session.
+
+    Restore the permission decorator saved by ``rbac_bypass`` when loading
+    the router. The shared permission-service fixture grants permissions.
+    """
+    import importlib
+
+    from fastapi import FastAPI
+    from mcpgateway.db import get_db
+    from mcpgateway.middleware.rbac import get_current_user_with_permissions
+    import mcpgateway.routers.mcp_servers_router as router_mod
+
+    with patch("mcpgateway.middleware.rbac.require_permission", rbac_originals["require_permission"]):
+        importlib.reload(router_mod)
+
+    test_app = FastAPI()
+    test_app.include_router(router_mod.router)
+
+    def override_db():
+        db = session_factory()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    async def override_user():
+        return user_ctx
+
+    test_app.dependency_overrides[get_db] = override_db
+    test_app.dependency_overrides[get_current_user_with_permissions] = override_user
+
+    return test_app
+
+
+def _make_thread_safe_db(visibility="team", owner_email="owner@example.com", url="http://example.com"):
+    """Return a (session_factory, engine) pair backed by a thread-safe in-memory SQLite DB.
+
+    Uses check_same_thread=False + StaticPool so the same connection is reused
+    safely across the test thread and TestClient's internal worker thread.
+    Inserts one team-B gateway row.
+    """
+    from sqlalchemy.pool import StaticPool
+
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(bind=engine)
+    session_factory = sessionmaker(autocommit=False, autoflush=False, expire_on_commit=False, bind=engine)
+    with session_factory() as setup:
+        setup.add(
+            DbGateway(
+                id="gw-team-b",
+                name="Team B Server",
+                slug="team-b-server",
+                url=url,
+                transport="STREAMABLEHTTP",
+                capabilities={},
+                enabled=True,
+                auth_type="basic",
+                auth_value={"Authorization": "Basic teamb"},
+                visibility=visibility,
+                team_id="team-b",
+                owner_email=owner_email,
+            )
+        )
+        setup.commit()
+    return session_factory, engine
+
+
+def test_handshake_http_candidate_only_succeeds(monkeypatch, rbac_bypass):
+    """POST /v1/mcp-servers/test-handshake with candidate_only returns 200 and uses only form credentials.
+
+    Drives the request through the real FastAPI ASGI stack — FastAPI body
+    validation and @require_permission("gateways.read") are both exercised.
+    The DB runs with check_same_thread=False so TestClient's worker thread
+    can access the same in-memory SQLite database.
+    """
+    from fastapi.testclient import TestClient
+    from mcpgateway import config
+
+    monkeypatch.setattr(config.settings, "platform_admin_email", "admin@example.com")
+    monkeypatch.setattr(config.settings, "gateway_test_allow_registered_only", False)
+    monkeypatch.setattr(config.settings, "gateway_test_allowed_hosts", ["example.com", "*.example.com"])
+
+    import socket
+
+    monkeypatch.setattr(
+        "mcpgateway.common.validators.socket.getaddrinfo",
+        lambda host, port, *a, **kw: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", port or 80))],
+    )
+
+    session_factory, engine = _make_thread_safe_db(visibility="public")
+    try:
+        user = {
+            "email": "admin@example.com",
+            "full_name": "Admin",
+            "is_admin": True,
+            "token_teams": None,
+            "permissions": ["gateways.read"],
+        }
+
+        test_app = _make_handshake_app(session_factory, user, rbac_bypass)
+        mock_client = _mock_resilient_client(_discover_success())
+
+        with patch("mcpgateway.services.gateway_service.ResilientHttpClient", return_value=mock_client):
+            client = TestClient(test_app, raise_server_exceptions=True)
+            response = client.post(
+                "/v1/mcp-servers/test-handshake",
+                json={
+                    "base_url": "http://example.com",
+                    "path": "/mcp",
+                    "headers": {"Api-Key": "candidate-token"},  # pragma: allowlist secret
+                    "gateway_id": "gw-team-b",
+                    "credential_mode": "candidate_only",
+                },
+            )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        # FastAPI serialises response_model fields with camelCase aliases.
+        assert body["success"] is True
+        assert body["credentialSource"] == "form"
+        # Stored basic-auth header must NOT have been forwarded.
+        sent_headers = mock_client.request.call_args.kwargs["headers"]
+        assert sent_headers.get("Api-Key") == "candidate-token"
+        assert "Authorization" not in sent_headers
+    finally:
+        engine.dispose()
+
+
+def test_handshake_http_candidate_only_denies_hidden_gateway(monkeypatch, rbac_bypass):
+    """POST /v1/mcp-servers/test-handshake denies a gateway invisible to the caller.
+
+    When a team-A token requests a team-B private gateway via gateway_id the
+    handshake must fail with failure_class='transport' and the outbound probe
+    must never fire.  Exercises the HTTP stack so @require_permission is live.
+    The DB runs with check_same_thread=False so TestClient's worker thread
+    can access the same in-memory SQLite database.
+    """
+    from fastapi.testclient import TestClient
+    from mcpgateway import config
+
+    monkeypatch.setattr(config.settings, "platform_admin_email", "admin@example.com")
+    monkeypatch.setattr(config.settings, "gateway_test_allow_registered_only", False)
+    monkeypatch.setattr(config.settings, "gateway_test_allowed_hosts", ["example.com", "*.example.com"])
+
+    import socket
+
+    monkeypatch.setattr(
+        "mcpgateway.common.validators.socket.getaddrinfo",
+        lambda host, port, *a, **kw: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", port or 80))],
+    )
+
+    # team-B gateway is team-scoped; caller token is limited to team-A only.
+    session_factory, engine = _make_thread_safe_db(visibility="team")
+    try:
+        team_a_user = {
+            "email": "user@example.com",
+            "full_name": "Team A User",
+            "is_admin": False,
+            "token_teams": ["team-a"],
+            "permissions": ["gateways.read"],
+        }
+
+        test_app = _make_handshake_app(session_factory, team_a_user, rbac_bypass)
+        mock_client = _mock_resilient_client()
+
+        with patch("mcpgateway.services.gateway_service.ResilientHttpClient", return_value=mock_client):
+            client = TestClient(test_app, raise_server_exceptions=True)
+            response = client.post(
+                "/v1/mcp-servers/test-handshake",
+                json={
+                    "base_url": "http://example.com",
+                    "headers": {"X-Api-Key": "candidate"},  # pragma: allowlist secret
+                    "gateway_id": "gw-team-b",
+                    "credential_mode": "candidate_only",
+                },
+            )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        # FastAPI serialises response_model fields with camelCase aliases.
+        assert body["success"] is False
+        assert body["failureClass"] == "transport"
+        # Probe must never have been sent to the upstream.
+        mock_client.request.assert_not_called()
+    finally:
+        engine.dispose()
