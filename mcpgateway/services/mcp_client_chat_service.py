@@ -41,7 +41,8 @@ except ImportError:
     # Optional dependencies for LLM chat feature not installed
     # These are only needed if LLMCHAT_ENABLED=true
     _LLMCHAT_AVAILABLE = False
-    BaseChatModel = None  # type: ignore
+    # Not None: GatewayProxyChatModel subclasses this at import time.
+    BaseChatModel = object  # type: ignore
     AIMessage = None  # type: ignore
     BaseMessage = None  # type: ignore
     HumanMessage = None  # type: ignore
@@ -1472,9 +1473,20 @@ class GatewayProxyChatModel(BaseChatModel):
 
     @property
     def _llm_type(self) -> str:
+        """Return the gateway proxy model type."""
         return "gateway_proxy"
 
     def bind_tools(self, tools: Sequence[Any], *, tool_choice: Optional[Union[str, Dict[str, Any]]] = None, **kwargs: Any) -> "GatewayProxyChatModel":
+        """Return a model copy with formatted tools and a tool choice.
+
+        Args:
+            tools: Tools to format for gateway requests.
+            tool_choice: Tool selection policy.
+            **kwargs: Additional options accepted for interface compatibility.
+
+        Returns:
+            Model copy with the supplied tool configuration.
+        """
         logger.warning(
             "GatewayProxyChatModel.bind_tools called model=%s tool_count=%s tool_choice=%s",
             self.model_id,
@@ -1518,9 +1530,31 @@ class GatewayProxyChatModel(BaseChatModel):
         return self.model_copy(update={"bound_tools": formatted_tools or None, "tool_choice": tool_choice})
 
     def _generate(self, messages: List[BaseMessage], stop: Optional[List[str]] = None, run_manager: Any = None, **kwargs: Any) -> Any:
+        """Reject synchronous generation.
+
+        Args:
+            messages: Input messages, unused.
+            stop: Stop sequences, unused.
+            run_manager: Callback manager, unused.
+            **kwargs: Additional options, unused.
+
+        Raises:
+            NotImplementedError: This model requires asynchronous execution.
+        """
         raise NotImplementedError("GatewayProxyChatModel only supports async execution")
 
     async def _agenerate(self, messages: List[BaseMessage], stop: Optional[List[str]] = None, run_manager: Any = None, **kwargs: Any) -> Any:
+        """Generate a chat result through the internal LLM proxy.
+
+        Args:
+            messages: Input chat messages.
+            stop: Stop sequences for the proxy request.
+            run_manager: Callback manager, unused.
+            **kwargs: Additional options, unused.
+
+        Returns:
+            Chat result with the proxy response and token usage.
+        """
         from langchain_core.messages import AIMessage
         from langchain_core.outputs import ChatGeneration, ChatResult
         from mcpgateway.db import SessionLocal
@@ -1558,6 +1592,17 @@ class GatewayProxyChatModel(BaseChatModel):
         )
 
     async def _astream(self, messages: List[BaseMessage], stop: Optional[List[str]] = None, run_manager: Any = None, **kwargs: Any) -> AsyncGenerator[Any, None]:
+        """Stream chat generation chunks through the internal LLM proxy.
+
+        Args:
+            messages: Input chat messages.
+            stop: Stop sequences for the proxy request.
+            run_manager: Callback manager, unused.
+            **kwargs: Additional options, unused.
+
+        Yields:
+            Chat generation chunks with content, reasoning, or tool calls.
+        """
         from langchain_core.messages import AIMessageChunk
         from langchain_core.outputs import ChatGenerationChunk
         from mcpgateway.db import SessionLocal
@@ -1589,6 +1634,16 @@ class GatewayProxyChatModel(BaseChatModel):
             await proxy_service.shutdown()
 
     def _build_request(self, messages: List[BaseMessage], stream: bool, stop: Optional[List[str]] = None) -> ChatCompletionRequest:
+        """Convert LangChain messages into a proxy chat request.
+
+        Args:
+            messages: Input chat messages.
+            stream: Enable streaming responses.
+            stop: Stop sequences for the proxy request.
+
+        Returns:
+            Chat request with the model settings and bound tools.
+        """
         from langchain_core.messages import AIMessage, ToolMessage
 
         request_messages = []
