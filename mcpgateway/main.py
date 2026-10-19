@@ -225,7 +225,7 @@ from mcpgateway.services.prompt_service import PromptError, PromptLockConflictEr
 from mcpgateway.services.resource_service import ResourceError, ResourceLockConflictError, ResourceNotFoundError, ResourceURIConflictError, ResourceValidationError
 from mcpgateway.services.server_service import ServerError, ServerLockConflictError, ServerNameConflictError, ServerNotFoundError
 from mcpgateway.services.tag_service import TagService
-from mcpgateway.services.tool_service import ToolError, ToolInvocationError, ToolLockConflictError, ToolNameConflictError, ToolNotFoundError
+from mcpgateway.services.tool_service import ToolError, ToolInvocationError, ToolLockConflictError, ToolNameConflictError, ToolNotFoundError, ToolUnavailableError
 from mcpgateway.transports.sse_transport import SSETransport
 from mcpgateway.transports.streamablehttp_transport import (
     _validate_streamable_session_access,
@@ -10652,6 +10652,9 @@ async def _execute_rpc_tools_call(
                     skip_pre_invoke=skip_pre_invoke,
                     require_model_visible=True,
                 )
+            except ToolUnavailableError as e:
+                logger.error("Tool unavailable: %s: %s", name, e)
+                raise JSONRPCError(-32000, str(e), {"tool": name})
             except (ToolNotFoundError, ValueError):
                 logger.error("Tool not found: %s", name)
                 raise JSONRPCError(-32601, f"Tool not found: {name}", None)

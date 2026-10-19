@@ -2786,6 +2786,40 @@ class TestGatewayService:
         assert result == mock_gateway_read
 
     @pytest.mark.asyncio
+    async def test_set_gateway_state_activate_init_failure_marks_unreachable(self, gateway_service, mock_gateway, test_db):
+        """Regression: activation must not commit reachable=True when the upstream init fails."""
+        mock_gateway.enabled = False
+        mock_gateway.reachable = False
+        mock_gateway.tools = []
+        mock_gateway.resources = []
+        mock_gateway.prompts = []
+        test_db.execute = Mock(
+            side_effect=[
+                _make_execute_result(scalar=mock_gateway),
+                _make_execute_result(rowcount=1),
+                _make_execute_result(rowcount=1),
+                _make_execute_result(rowcount=1),
+            ]
+        )
+        test_db.commit = Mock()
+        test_db.refresh = Mock()
+        gateway_service._notify_gateway_offline = AsyncMock()
+        gateway_service._notify_gateway_activated = AsyncMock()
+        gateway_service._initialize_gateway = AsyncMock(side_effect=ConnectionError("connection refused"))
+
+        mock_gateway_read = MagicMock()
+        mock_gateway_read.masked.return_value = mock_gateway_read
+
+        with patch("mcpgateway.services.gateway_service.GatewayRead.model_validate", return_value=mock_gateway_read):
+            await gateway_service.set_gateway_state(test_db, 1, activate=True)
+
+        assert mock_gateway.enabled is True
+        assert mock_gateway.reachable is False
+        assert mock_gateway.last_error
+        gateway_service._notify_gateway_offline.assert_called_once()
+        gateway_service._notify_gateway_activated.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_set_gateway_state_only_update_reachable_skips_prompts_resources(self, gateway_service, mock_gateway, test_db):
         """Test that only_update_reachable=True skips prompt/resource state updates."""
         # First call returns gateway (SELECT), second call returns UPDATE result for tools only
@@ -3909,6 +3943,58 @@ class TestGatewayRefresh:
         assert result["tools_added"] == 0
         # Should verify no init calls made
         assert not hasattr(gateway_service._initialize_gateway, "called") or not gateway_service._initialize_gateway.called
+
+    @pytest.mark.asyncio
+    async def test_manual_refresh_probes_unreachable_gateway_and_revives_it(self, gateway_service, mock_gateway_with_relations, mock_db_session):
+        """Regression: manual refresh of an offline gateway must probe it and mark it reachable, not silently succeed."""
+        mock_gateway_with_relations.reachable = False
+        session = mock_db_session.__enter__()
+        session.execute.return_value = _make_execute_result(scalar=mock_gateway_with_relations)
+        gateway_service._mark_gateway_reachable = AsyncMock()
+
+        with patch("mcpgateway.services.gateway_service.fresh_db_session", return_value=mock_db_session):
+            gateway_service._initialize_gateway = AsyncMock(return_value=({}, [], [], [], []))
+            result = await gateway_service._refresh_gateway_tools_resources_prompts("gw-123", gateway=mock_gateway_with_relations, created_via="manual_refresh")
+
+        gateway_service._initialize_gateway.assert_awaited_once()
+        assert result["success"] is True
+        gateway_service._mark_gateway_reachable.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_manual_refresh_unreachable_gateway_still_down_reports_failure(self, gateway_service, mock_gateway_with_relations):
+        """Regression: a failed probe on an offline gateway reports success=False and leaves it offline."""
+        mock_gateway_with_relations.reachable = False
+        gateway_service._mark_gateway_reachable = AsyncMock()
+        gateway_service._initialize_gateway = AsyncMock(side_effect=ConnectionError("refused"))
+
+        result = await gateway_service._refresh_gateway_tools_resources_prompts("gw-123", gateway=mock_gateway_with_relations, created_via="manual_refresh")
+
+        assert result["success"] is False
+        assert result["error"]
+        gateway_service._mark_gateway_reachable.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_manual_refresh_disabled_gateway_reports_failure(self, gateway_service, mock_gateway_with_relations):
+        """Regression: manual refresh of a disabled gateway returns success=False instead of a silent zero-count success."""
+        mock_gateway_with_relations.enabled = False
+        gateway_service._initialize_gateway = AsyncMock()
+
+        result = await gateway_service._refresh_gateway_tools_resources_prompts("gw-123", gateway=mock_gateway_with_relations, created_via="manual_refresh")
+
+        assert result["success"] is False
+        assert result["error"] == "Gateway is disabled"
+        gateway_service._initialize_gateway.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_health_refresh_still_skips_unreachable_gateway(self, gateway_service, mock_gateway_with_relations):
+        """Background refresh must keep skipping offline gateways; only manual refresh probes them."""
+        mock_gateway_with_relations.reachable = False
+        gateway_service._initialize_gateway = AsyncMock()
+
+        result = await gateway_service._refresh_gateway_tools_resources_prompts("gw-123", gateway=mock_gateway_with_relations)
+
+        assert result["success"] is True
+        gateway_service._initialize_gateway.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_refresh_gateway_connection_error(self, gateway_service, mock_gateway_with_relations):
@@ -6901,6 +6987,7 @@ class TestSetGatewayState:
             auth_type=None,
             auth_query_params=None,
             version=1,
+            owner_email=None,
         )
         db = self._make_db_for_state(gw)
         gateway_service._initialize_gateway = AsyncMock(return_value=({}, [], [], [], []))

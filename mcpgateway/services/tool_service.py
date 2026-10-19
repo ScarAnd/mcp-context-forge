@@ -1009,6 +1009,16 @@ class ToolNotFoundError(ToolError):
     """
 
 
+class ToolUnavailableError(ToolNotFoundError):
+    """Raised when a tool exists but is inactive or its upstream is offline.
+
+    Examples:
+        >>> from mcpgateway.services.tool_service import ToolUnavailableError, ToolNotFoundError
+        >>> isinstance(ToolUnavailableError("Tool 'x' exists but is currently offline"), ToolNotFoundError)
+        True
+    """
+
+
 class ToolNameConflictError(ToolError):
     """Raised when a tool name conflicts with existing (active or inactive) tool."""
 
@@ -1629,9 +1639,9 @@ class ToolService(BaseService):
         if status == "missing":
             raise ToolNotFoundError(f"Tool not found: {name}")
         if status == "inactive":
-            raise ToolNotFoundError(f"Tool '{name}' exists but is inactive")
+            raise ToolUnavailableError(f"Tool '{name}' exists but is inactive")
         if status == "offline":
-            raise ToolNotFoundError(f"Tool '{name}' exists but is currently offline. Please verify if it is running.")
+            raise ToolUnavailableError(f"Tool '{name}' exists but is currently offline. Please verify if it is running.")
         if status == "deprecated":
             raise ToolInvocationError(f"Tool '{name}' is deprecated and cannot be executed. Please update your agent to use an alternative tool.")
         logger.warning("Ignoring unknown negative tool cache status %r for tool %s", status, name)
@@ -5152,7 +5162,7 @@ class ToolService(BaseService):
             negative_cache_allowed = not caller_dependent_resolution
 
             if not tool.enabled:
-                raise ToolNotFoundError(f"Tool '{name}' exists but is inactive")
+                raise ToolUnavailableError(f"Tool '{name}' exists but is inactive")
 
             if not tool.reachable:
                 if negative_cache_allowed:
@@ -5164,7 +5174,7 @@ class ToolService(BaseService):
                         gateway_id=str(tool_gateway_id) if tool_gateway_id else None,
                         server_id=server_id,
                     )
-                raise ToolNotFoundError(f"Tool '{name}' exists but is currently offline. Please verify if it is running.")
+                raise ToolUnavailableError(f"Tool '{name}' exists but is currently offline. Please verify if it is running.")
 
             gateway = tool.gateway
             cache_payload = self._build_tool_cache_payload(tool, gateway)
@@ -5180,9 +5190,9 @@ class ToolService(BaseService):
                     await tool_lookup_cache.set(name, cache_payload, gateway_id=gateway_id)
 
         if tool_payload.get("enabled") is False:
-            raise ToolNotFoundError(f"Tool '{name}' exists but is inactive")
+            raise ToolUnavailableError(f"Tool '{name}' exists but is inactive")
         if tool_payload.get("reachable") is False:
-            raise ToolNotFoundError(f"Tool '{name}' exists but is currently offline. Please verify if it is running.")
+            raise ToolUnavailableError(f"Tool '{name}' exists but is currently offline. Please verify if it is running.")
 
         # ═══════════════════════════════════════════════════════════════════════════
         # SECURITY: Check tool access based on visibility and team membership

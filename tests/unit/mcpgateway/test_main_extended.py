@@ -115,7 +115,7 @@ from mcpgateway.main import (
 )
 from cpex.framework import PluginError, PromptHookType, ResourceHookType
 from mcpgateway.schemas import PromptCreate, PromptUpdate, ResourceCreate, ResourceUpdate, ToolCreate, ToolUpdate
-from mcpgateway.services.tool_service import ToolError, ToolNotFoundError
+from mcpgateway.services.tool_service import ToolError, ToolNotFoundError, ToolUnavailableError
 from mcpgateway.transports.streamablehttp_transport import user_context_var
 from mcpgateway.validation.jsonrpc import JSONRPCError
 
@@ -8126,6 +8126,44 @@ class TestRpcHandling:
         assert result["id"] == "4"
         assert result["error"]["code"] == -32601
         assert "Tool not found: missing-tool" in result["error"]["message"]
+        mock_db.commit.assert_called_once()
+        mock_db.close.assert_called()
+
+    async def test_handle_internal_mcp_tools_call_returns_jsonrpc_unavailable(self):
+        request = self._make_request({"jsonrpc": "2.0", "id": "4", "method": "tools/call", "params": {"name": "missing-tool", "arguments": {}}})
+        request.headers = {
+            "x-contextforge-mcp-runtime": "rust",
+            "x-contextforge-auth-context": base64.urlsafe_b64encode(
+                json.dumps(
+                    {
+                        "email": "user@example.com",
+                        "teams": ["team-a"],
+                        "is_authenticated": True,
+                        "is_admin": False,
+                        "permission_is_admin": True,
+                        "scoped_permissions": ["tools.execute"],
+                    }
+                ).encode()
+            )
+            .decode()
+            .rstrip("="),
+        }
+        request.client = SimpleNamespace(host="127.0.0.1")
+        mock_db = MagicMock()
+        mock_db.is_active = True
+        mock_db.in_transaction.return_value = object()
+
+        with (
+            patch("mcpgateway.main.SessionLocal", return_value=mock_db),
+            patch("mcpgateway.main._ensure_rpc_permission", new=AsyncMock()),
+            patch("mcpgateway.main.tool_service.invoke_tool", new=AsyncMock(side_effect=ToolUnavailableError("Tool 'missing-tool' exists but is currently offline"))),
+        ):
+            result = await handle_internal_mcp_tools_call(request)
+
+        assert result["jsonrpc"] == "2.0"
+        assert result["id"] == "4"
+        assert result["error"]["code"] == -32000
+        assert "exists but is currently offline" in result["error"]["message"]
         mock_db.commit.assert_called_once()
         mock_db.close.assert_called()
 

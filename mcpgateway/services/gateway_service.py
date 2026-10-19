@@ -4181,6 +4181,10 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
                         raise
                     except Exception as e:
                         logger.warning("Failed to initialize reactivated gateway: %s", e)
+                        reachable = False
+                        gateway.reachable = False
+                        gateway.last_error = _safe_connection_error_text(e)
+                        self._active_gateways.discard(gateway.url)
                 else:
                     self._active_gateways.discard(gateway.url)
 
@@ -7211,11 +7215,17 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
         gateway_auth_query_params = None
         refresh_client_cert = None
         refresh_client_key = None
+        was_unreachable = False
 
         if gateway:
-            if not gateway.enabled or not gateway.reachable:
+            if not gateway.enabled or (not gateway.reachable and created_via != "manual_refresh"):
                 logger.debug("Skipping tool refresh for disabled/unreachable gateway %s", SecurityValidator.sanitize_log_message(gateway.name))
+                if created_via == "manual_refresh":
+                    result["success"] = False
+                    result["error"] = "Gateway is disabled"
                 return result
+
+            was_unreachable = not gateway.reachable
 
             gateway_name = gateway.name
             gateway_url = gateway.url
@@ -7235,9 +7245,14 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
                     logger.warning("Gateway %s not found for tool refresh", SecurityValidator.sanitize_log_message(gateway_id))
                     return result
 
-                if not gateway_obj.enabled or not gateway_obj.reachable:
+                if not gateway_obj.enabled or (not gateway_obj.reachable and created_via != "manual_refresh"):
                     logger.debug("Skipping tool refresh for disabled/unreachable gateway %s", gateway_obj.name)
+                    if created_via == "manual_refresh":
+                        result["success"] = False
+                        result["error"] = "Gateway is disabled"
                     return result
+
+                was_unreachable = not gateway_obj.reachable
 
                 # Extract metadata before session closes
                 gateway_name = gateway_obj.name
@@ -7434,6 +7449,10 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
             else:
                 db.commit()
                 logger.debug("No changes detected during refresh of gateway %s", gateway_name)
+
+        # The upstream answered a full discovery, so a manual refresh also revives a gateway marked offline.
+        if was_unreachable:
+            await self._mark_gateway_reachable(gateway_id, gateway_name, True, False, reactivation_reason="manual refresh succeeded")
 
         # Advance poll schedule so hot/cold classification tracks the actual last refresh
         # regardless of whether the refresh was triggered by health check, manual API, or registration.
