@@ -64,6 +64,7 @@ def test_gateway_provider_anthropic_completion(monkeypatch):
     model = SimpleNamespace(id="m1", model_id="claude-1", enabled=True, provider_id="p1", max_output_tokens=128)
     provider = SimpleNamespace(
         id="p1",
+        name="Anthropic",
         provider_type="anthropic",
         enabled=True,
         api_key=None,

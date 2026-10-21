@@ -787,6 +787,14 @@ class TestToolService:
         assert tool_read.metrics.total_executions == 3
         assert tool_read.execution_count == 3
 
+    @pytest.mark.parametrize("include_metrics,total_executions", [(True, 0), (False, 0), (False, 3)])
+    def test_convert_tool_to_read_omits_metrics(self, tool_service, mock_tool, include_metrics, total_executions):
+        """Return null metrics when excluded or when no executions exist."""
+        mock_tool.metrics_summary["total_executions"] = total_executions
+        tool_read = tool_service.convert_tool_to_read(mock_tool, include_metrics=include_metrics, include_auth=False)
+        assert tool_read.metrics is None
+        assert tool_read.execution_count is None
+
     @pytest.mark.asyncio
     async def test_register_tool(self, tool_service, mock_tool, test_db):
         """Test successful tool registration."""
@@ -1578,7 +1586,8 @@ class TestToolService:
         )
 
     @pytest.mark.asyncio
-    async def test_get_tool(self, tool_service, mock_tool, test_db):
+    @pytest.mark.parametrize("include_metrics", [None, True, False])
+    async def test_get_tool(self, tool_service, mock_tool, test_db, include_metrics):
         """Test getting a tool by ID."""
         # Mock DB get to return tool
         test_db.get = Mock(return_value=mock_tool)
@@ -1622,14 +1631,21 @@ class TestToolService:
         tool_service.convert_tool_to_read = Mock(return_value=tool_read)
 
         # Call method
-        result = await tool_service.get_tool(test_db, 1)
+        options = {} if include_metrics is None else {"include_metrics": include_metrics}
+        result = await tool_service.get_tool(test_db, 1, **options)
 
         # Verify DB query
         test_db.get.assert_called_once_with(DbTool, 1)
 
         # Verify result
         assert result == tool_read
-        tool_service.convert_tool_to_read.assert_called_once_with(mock_tool, requesting_user_email=None, requesting_user_is_admin=False, requesting_user_team_roles=None)
+        tool_service.convert_tool_to_read.assert_called_once_with(
+            mock_tool,
+            include_metrics=True if include_metrics is None else include_metrics,
+            requesting_user_email=None,
+            requesting_user_is_admin=False,
+            requesting_user_team_roles=None,
+        )
 
     @pytest.mark.asyncio
     async def test_get_tool_not_found(self, tool_service, test_db):

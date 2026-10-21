@@ -122,6 +122,7 @@ def isolated_gateway(tmp_path):
         "MCPGATEWAY_A2A_ENABLED": "false",
         "SSRF_ALLOW_LOCALHOST": "true",
         "PLUGINS_ENABLED": "false",
+        "METRICS_BUFFER_ENABLED": "false",
         "REST_RESPONSE_TEXT_MAX_LENGTH": str(_MAX_LENGTH),
         "LOG_LEVEL": "ERROR",
         "PYTHONUNBUFFERED": "1",
@@ -253,3 +254,27 @@ def test_large_valid_json_with_output_schema_succeeds(isolated_gateway):
     with _call_schema_tool(client, token, _LargeValidJSONHandler, tool_name="rest_large_valid_output_schema_probe") as (call_response, result):
         assert result.get("isError") is not True, call_response.text
         assert result.get("structuredContent") == {"results": ["x" * 6000]}
+
+
+def test_tool_detail_metrics_after_invocation(isolated_gateway):
+    """Return recorded tool metrics by default and honor the metrics query option."""
+    client, token = isolated_gateway
+    tool_name = "rest_tool_detail_metrics_probe"
+    with _call_schema_tool(client, token, _LargeValidJSONHandler, tool_name=tool_name) as (call_response, result):
+        assert result.get("isError") is not True, call_response.text
+        listed = client.get("/tools")
+        assert listed.status_code == 200, listed.text
+        tool_id = next(tool["id"] for tool in listed.json() if tool["originalName"] == tool_name)
+
+        for query in ("", "?include_metrics=true"):
+            response = client.get(f"/tools/{tool_id}{query}")
+            assert response.status_code == 200, response.text
+            data = response.json()
+            assert data["metrics"]["totalExecutions"] == 1, data
+            assert data["metrics"]["successfulExecutions"] == 1, data
+            assert data["executionCount"] == 1, data
+
+        excluded = client.get(f"/tools/{tool_id}?include_metrics=false")
+        assert excluded.status_code == 200, excluded.text
+        assert excluded.json()["metrics"] is None
+        assert excluded.json()["executionCount"] is None

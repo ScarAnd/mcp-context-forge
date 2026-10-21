@@ -1437,12 +1437,22 @@ class TestToolEndpoints:
         assert response.status_code == 200
         mock_create.assert_called_once()
 
+    @pytest.mark.parametrize("query,include_metrics", [("", True), ("?include_metrics=true", True), ("?include_metrics=false", False)])
     @patch("mcpgateway.main.tool_service.get_tool")
-    def test_get_tool_endpoint(self, mock_get, test_client, auth_headers):
+    def test_get_tool_endpoint(self, mock_get, test_client, auth_headers, query, include_metrics):
+        """Forward the metrics option, including its default, to the service."""
         mock_get.return_value = MOCK_TOOL_READ_SNAKE
-        response = test_client.get("/tools/1", headers=auth_headers)
+        response = test_client.get(f"/tools/1{query}", headers=auth_headers)
         assert response.status_code == 200
         mock_get.assert_called_once()
+        assert mock_get.call_args.kwargs["include_metrics"] is include_metrics
+
+    @patch("mcpgateway.main.tool_service.get_tool")
+    def test_get_tool_rejects_invalid_metrics_option(self, mock_get, test_client, auth_headers):
+        """Reject invalid metrics options before calling the service."""
+        response = test_client.get("/tools/1?include_metrics=invalid", headers=auth_headers)
+        assert response.status_code == 422
+        mock_get.assert_not_called()
 
     @patch("mcpgateway.main.tool_service.get_tool")
     def test_get_tool_admin_bypass_private_returns_404(self, mock_get, test_client, auth_headers):

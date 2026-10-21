@@ -1724,8 +1724,8 @@ class ToolService(BaseService):
         # Compute metrics in a single pass (matches server/resource/prompt service pattern)
         if include_metrics:
             metrics = tool.metrics_summary  # Single-pass computation
-            tool_dict["metrics"] = metrics
-            tool_dict["execution_count"] = metrics["total_executions"]
+            tool_dict["metrics"] = metrics if metrics["total_executions"] else None
+            tool_dict["execution_count"] = metrics["total_executions"] or None
         else:
             tool_dict["metrics"] = None
             tool_dict["execution_count"] = None
@@ -3711,6 +3711,7 @@ class ToolService(BaseService):
         requesting_user_is_admin: bool = False,
         requesting_user_team_roles: Optional[Dict[str, str]] = None,
         token_teams: Optional[List[str]] = None,
+        include_metrics: bool = True,
     ) -> ToolRead:
         """
         Retrieve a tool by its ID with access control.
@@ -3727,6 +3728,7 @@ class ToolService(BaseService):
                 ``[]`` means public-only scope. ``[...]`` means team-scoped.
                 This is kept separate from ``requesting_user_team_roles`` to avoid the Layer 1
                 visibility check silently widening a scoped token to full DB team membership.
+            include_metrics (bool): Whether to include metrics. Defaults to True.
 
         Returns:
             ToolRead: The tool object.
@@ -3780,6 +3782,7 @@ class ToolService(BaseService):
 
         tool_read = self.convert_tool_to_read(
             tool,
+            include_metrics=include_metrics,
             requesting_user_email=requesting_user_email,
             requesting_user_is_admin=requesting_user_is_admin,
             requesting_user_team_roles=requesting_user_team_roles,

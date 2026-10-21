@@ -1154,7 +1154,7 @@ async def test_connect_no_server(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(llmchat_router, "MCPChatService", DummyChatService)
 
     request = MagicMock()
-    request.cookies = {}
+    request.cookies = {"jwt_token": "token"}
     request.headers = {}
 
     input_data = ConnectInput(user_id="user1", llm=LLMInput(model="gpt"), server=None)
@@ -1162,6 +1162,20 @@ async def test_connect_no_server(monkeypatch: pytest.MonkeyPatch):
     result = await llmchat_router.connect(input_data, request, user={"id": "user1", "email": "user1@test.com", "db": MagicMock()})
 
     assert result["status"] == "connected"
+
+
+@pytest.mark.asyncio
+async def test_connect_no_server_requires_token():
+    """Reject a missing token when the server configuration is omitted."""
+    request = MagicMock()
+    request.cookies = {}
+    request.headers = {}
+    input_data = ConnectInput(user_id="user1", llm=LLMInput(model="gpt"), server=None)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await llmchat_router.connect(input_data, request, user={"id": "user1", "email": "user1@test.com", "db": MagicMock()})
+
+    assert excinfo.value.status_code == 401
 
 
 @pytest.mark.asyncio
