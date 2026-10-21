@@ -48,9 +48,9 @@ from fastapi import HTTPException
 from fastapi.security.utils import get_authorization_scheme_param
 import jwt
 from mcp.server.lowlevel import Server
-from mcp.shared.exceptions import MCPError
 from mcp.server.streamable_http import EventCallback, EventId, EventMessage, EventStore, StreamId
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp.shared.exceptions import MCPError
 import mcp_types as types
 from mcp_types import JSONRPCMessage
 from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS, MODERN_PROTOCOL_VERSIONS
@@ -86,6 +86,7 @@ from mcpgateway.services.mcp_apps import (
     filter_model_visible_tools,
     serialize_resource_content_for_mcp,
 )
+from mcpgateway.services.mcp_catalog_service import collect_proxy_catalog, list_catalog_page, log_proxy_catalog_failure
 from mcpgateway.services.metrics import (
     mcp_auth_cache_events_counter,
     oauth_verify_events_counter,
@@ -96,7 +97,7 @@ from mcpgateway.services.metrics import (
 from mcpgateway.services.oauth_manager import OAuthEnforcementUnavailableError, OAuthRequiredError
 from mcpgateway.services.permission_service import PermissionService
 from mcpgateway.services.prompt_service import PromptNotFoundError, PromptService, PromptUpstreamError, PromptValidationError
-from mcpgateway.services.resource_service import ResourceNotFoundError, ResourceService, set_upstream_cache_directive, upstream_read_cache_var
+from mcpgateway.services.resource_service import ResourceNotFoundError, ResourceService, ResourceUpstreamError, set_upstream_cache_directive, upstream_read_cache_var
 from mcpgateway.services.tool_service import ToolInputRequired, ToolInvocationError, ToolNotFoundError, ToolService
 from mcpgateway.transports.context import UserContext
 from mcpgateway.transports.redis_event_store import RedisEventStore
@@ -109,6 +110,7 @@ from mcpgateway.utils.orjson_response import ORJSONResponse
 from mcpgateway.utils.passthrough_headers import compute_passthrough_headers_cached
 from mcpgateway.utils.server_urls import build_server_mcp_url
 from mcpgateway.utils.trace_context import set_trace_context_from_teams, set_trace_session_id
+from mcpgateway.utils.mcp_cursor import catalog_session_id
 from mcpgateway.utils.verify_credentials import (
     _resolve_auth_header_name,
     get_auth_header_value,
@@ -117,6 +119,7 @@ from mcpgateway.utils.verify_credentials import (
     verify_credentials,
     verify_oauth_access_token,
 )
+from mcpgateway.validation.jsonrpc import JSONRPCError
 
 # Initialize logging service first
 logging_service = LoggingService()
@@ -204,10 +207,7 @@ def _check_mcp_host(host: Optional[str]) -> bool:
 class MCPOriginHostGate:
     """ASGI gate that enforces MCP Origin/Host allowlists at the public /mcp mount.
 
-    Runs before any ingress dispatch (Python, rust-internal, rust-public) so the
-    check is not duplicated per-transport. The ``/_internal/mcp/transport`` bridge
-    is mounted separately and intentionally bypasses this gate — requests on that
-    path arrive from the trusted Rust sidecar at 127.0.0.1 only.
+    Runs before ingress dispatch so the check is not duplicated per-transport.
 
     When session-affinity is enabled, loopback-sourced requests carrying
     ``x-forwarded-internally: true`` are also bypassed (worker-to-worker routing).
@@ -360,12 +360,14 @@ def _tools_for_client(tools: Iterable[Any]) -> List[types.Tool]:
 
 def _to_mcp_resource(resource: Any) -> types.Resource:
     """Convert an internal resource record to the MCP transport model."""
+    size = getattr(resource, "size", None)
     payload: Dict[str, Any] = {
         "uri": resource.uri,
         "name": resource.name,
         "title": _safe_str_attr(resource, "title"),
         "description": resource.description,
         "mimeType": resource.mime_type,
+        "size": size if isinstance(size, int) else None,
     }
     apply_resource_meta(payload, getattr(resource, "extension_metadata", None))
     return types.Resource.model_validate({key: value for key, value in payload.items() if value is not None})
@@ -1483,7 +1485,52 @@ async def _close_streamable_http_session(
     return HTTP_200_OK, {"jsonrpc": "2.0", "result": {}}
 
 
-async def _proxy_list_tools_to_gateway(gateway: Any, request_headers: dict, user_context: dict, meta: Optional[Any] = None) -> List[types.Tool]:  # pylint: disable=unused-argument
+def _build_proxy_list_headers(gateway: Any, request_headers: dict) -> dict[str, str]:
+    """Build the effective upstream headers for direct-proxy catalog requests.
+
+    Args:
+        gateway: Authorized upstream gateway.
+        request_headers: Incoming request headers.
+
+    Returns:
+        Approved upstream authentication and passthrough headers.
+    """
+    # Prepare headers with gateway auth
+    headers = build_gateway_auth_headers(gateway)
+
+    # Forward passthrough headers using shared utility (includes X-Upstream-Authorization rename)
+    if request_headers:
+        gw_passthrough = gateway.passthrough_headers if hasattr(gateway, "passthrough_headers") and gateway.passthrough_headers is not None else None
+        if gw_passthrough is not None:
+            passthrough_allowed = gw_passthrough
+        else:
+            with SessionLocal() as db:
+                passthrough_allowed = global_config_cache.get_passthrough_headers(db, settings.default_passthrough_headers)
+        headers = compute_passthrough_headers_cached(
+            request_headers,
+            headers,
+            passthrough_allowed,
+            gateway_auth_type=gateway.auth_type if hasattr(gateway, "auth_type") else None,
+            gateway_passthrough_headers=gw_passthrough,
+        )
+
+    # Inject identity propagation headers
+    identity = user_identity_var.get()
+    if identity:
+        headers.update(build_identity_headers(identity, gateway))
+
+    return headers
+
+
+async def _proxy_list_tools_to_gateway(
+    gateway: Any,
+    request_headers: dict,
+    user_context: dict,  # pylint: disable=unused-argument
+    meta: Optional[Any] = None,
+    *,
+    paginate: bool = False,
+    serialized_items: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> List[types.Tool]:
     """Proxy tools/list request directly to remote MCP gateway using MCP SDK.
 
     Args:
@@ -1491,34 +1538,14 @@ async def _proxy_list_tools_to_gateway(gateway: Any, request_headers: dict, user
         request_headers: Request headers from client
         user_context: User context (not used - _meta comes from MCP SDK)
         meta: Request metadata (_meta) from the original request
+        paginate: Collect every upstream page in the same session.
+        serialized_items: Optional output cache for collected wire descriptors.
 
     Returns:
         List of Tool objects from remote server
     """
     try:
-        # Prepare headers with gateway auth
-        headers = build_gateway_auth_headers(gateway)
-
-        # Forward passthrough headers using shared utility (includes X-Upstream-Authorization rename)
-        if request_headers:
-            gw_passthrough = gateway.passthrough_headers if hasattr(gateway, "passthrough_headers") and gateway.passthrough_headers is not None else None
-            if gw_passthrough is not None:
-                passthrough_allowed = gw_passthrough
-            else:
-                with SessionLocal() as db:
-                    passthrough_allowed = global_config_cache.get_passthrough_headers(db, settings.default_passthrough_headers)
-            headers = compute_passthrough_headers_cached(
-                request_headers,
-                headers,
-                passthrough_allowed,
-                gateway_auth_type=gateway.auth_type if hasattr(gateway, "auth_type") else None,
-                gateway_passthrough_headers=gw_passthrough,
-            )
-
-        # Inject identity propagation headers
-        identity = user_identity_var.get()
-        if identity:
-            headers.update(build_identity_headers(identity, gateway))
+        headers = _build_proxy_list_headers(gateway, request_headers)
 
         # Use MCP v2 Client to connect and list tools
         async with mcp_proxy_client(
@@ -1526,6 +1553,9 @@ async def _proxy_list_tools_to_gateway(gateway: Any, request_headers: dict, user
             headers=headers,
             timeout=settings.mcpgateway_direct_proxy_timeout,
         ) as client:
+            if paginate:
+                collected = await collect_proxy_catalog(client, "tools/list", meta, serialized_items)
+                return filter_model_visible_tools(collected)
             # List tools with _meta forwarded
             if meta:
                 logger.debug("Forwarding _meta to remote gateway (keys: %s)", sorted(meta.keys()) if isinstance(meta, dict) else type(meta).__name__)
@@ -1535,11 +1565,24 @@ async def _proxy_list_tools_to_gateway(gateway: Any, request_headers: dict, user
             return filter_model_visible_tools(tools_result.tools)
 
     except Exception as e:
+        if paginate:
+            log_proxy_catalog_failure(gateway.id, "tools/list", e)
+            if isinstance(e, JSONRPCError):
+                raise
+            raise JSONRPCError(-32000, "Direct-proxy MCP catalog collection failed") from e
         logger.exception("Error proxying tools/list to gateway %s: %s", gateway.id, e)
         return []
 
 
-async def _proxy_list_resources_to_gateway(gateway: Any, request_headers: dict, user_context: dict, meta: Optional[Any] = None) -> List[types.Resource]:  # pylint: disable=unused-argument
+async def _proxy_list_resources_to_gateway(
+    gateway: Any,
+    request_headers: dict,
+    user_context: dict,  # pylint: disable=unused-argument
+    meta: Optional[Any] = None,
+    *,
+    paginate: bool = False,
+    serialized_items: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> List[types.Resource]:
     """Proxy resources/list request directly to remote MCP gateway using MCP SDK.
 
     Args:
@@ -1547,34 +1590,14 @@ async def _proxy_list_resources_to_gateway(gateway: Any, request_headers: dict, 
         request_headers: Request headers from client
         user_context: User context (not used - _meta comes from MCP SDK)
         meta: Request metadata (_meta) from the original request
+        paginate: Collect every upstream page in the same session.
+        serialized_items: Optional output cache for collected wire descriptors.
 
     Returns:
         List of Resource objects from remote server
     """
     try:
-        # Prepare headers with gateway auth
-        headers = build_gateway_auth_headers(gateway)
-
-        # Forward passthrough headers using shared utility (includes X-Upstream-Authorization rename)
-        if request_headers:
-            gw_passthrough = gateway.passthrough_headers if hasattr(gateway, "passthrough_headers") and gateway.passthrough_headers is not None else None
-            if gw_passthrough is not None:
-                passthrough_allowed = gw_passthrough
-            else:
-                with SessionLocal() as db:
-                    passthrough_allowed = global_config_cache.get_passthrough_headers(db, settings.default_passthrough_headers)
-            headers = compute_passthrough_headers_cached(
-                request_headers,
-                headers,
-                passthrough_allowed,
-                gateway_auth_type=gateway.auth_type if hasattr(gateway, "auth_type") else None,
-                gateway_passthrough_headers=gw_passthrough,
-            )
-
-        # Inject identity propagation headers
-        identity = user_identity_var.get()
-        if identity:
-            headers.update(build_identity_headers(identity, gateway))
+        headers = _build_proxy_list_headers(gateway, request_headers)
 
         logger.info("Proxying resources/list to gateway %s at %s", gateway.id, gateway.url)
         if meta:
@@ -1587,6 +1610,9 @@ async def _proxy_list_resources_to_gateway(gateway: Any, request_headers: dict, 
             headers=headers,
             timeout=settings.mcpgateway_direct_proxy_timeout,
         ) as client:
+            if paginate:
+                collected = await collect_proxy_catalog(client, "resources/list", meta, serialized_items)
+                return collected
             # List resources with _meta forwarded (auto-initializes on first call)
             if meta:
                 logger.debug("Forwarding _meta to remote gateway (keys: %s)", sorted(meta.keys()) if isinstance(meta, dict) else type(meta).__name__)
@@ -1599,6 +1625,11 @@ async def _proxy_list_resources_to_gateway(gateway: Any, request_headers: dict, 
             return resource_list
 
     except Exception as e:
+        if paginate:
+            log_proxy_catalog_failure(gateway.id, "resources/list", e)
+            if isinstance(e, JSONRPCError):
+                raise
+            raise JSONRPCError(-32000, "Direct-proxy MCP catalog collection failed") from e
         logger.exception("Error proxying resources/list to gateway %s: %s", gateway.id, e)
         return []
 
@@ -1682,6 +1713,27 @@ def _caller_is_modern() -> bool:
         bool: Whether the request's protocol version is a modern one.
     """
     return getattr(_v2_request_ctx.get(), "protocol_version", None) in MODERN_PROTOCOL_VERSIONS
+
+
+LEGACY_RESOURCE_NOT_FOUND = -32002
+
+
+def _relayed_upstream_code(code: int) -> int:
+    """Return the JSON-RPC code to relay: a modern caller never sees the retired -32002.
+
+    Args:
+        code: The code the upstream answered with.
+
+    Returns:
+        int: ``INVALID_PARAMS`` for ``-32002`` on a modern wire; ``code`` otherwise.
+
+    Examples:
+        >>> _relayed_upstream_code(-32601)
+        -32601
+    """
+    if code == LEGACY_RESOURCE_NOT_FOUND and _caller_is_modern():
+        return types.INVALID_PARAMS
+    return code
 
 
 def _json_equal(left: Any, right: Any) -> bool:
@@ -1799,6 +1851,29 @@ def _truthy_is_error(result: Any) -> bool:
         literally ``True``.
     """
     return getattr(result, "is_error", False) is True or getattr(result, "isError", False) is True
+
+
+def _reject_invalid_meta(meta_data: Optional[Dict[str, Any]]) -> None:
+    """Reject request ``_meta`` that exceeds the configured limits (CWE-400).
+
+    Args:
+        meta_data: The ``_meta`` mapping extracted from the request context.
+
+    Raises:
+        MCPError: With ``INVALID_PARAMS`` (-32602) when a limit is exceeded.
+
+    Examples:
+        >>> _reject_invalid_meta(None)
+        >>> _reject_invalid_meta({"a": {"b": {"c": 1}}})
+        Traceback (most recent call last):
+            ...
+        mcp.shared.exceptions.MCPError: meta_data exceeds maximum nesting depth (2)
+    """
+    try:
+        _validate_meta_data(meta_data)
+    except ValueError as e:
+        logger.info("Rejected request _meta: %s", e)
+        raise MCPError(code=types.INVALID_PARAMS, message=str(e)) from e
 
 
 def _get_plugin_contexts_or_none() -> Tuple[Optional[GlobalContext], Optional[PluginContextTable]]:
@@ -1939,6 +2014,8 @@ async def call_tool(
         # request_context might not be active in some edge cases (e.g. tests)
         logger.debug("No active request context found")
 
+    _reject_invalid_meta(meta_data)
+
     async def _relay_progress(progress: float, total: float | None = None, message: str | None = None) -> None:
         """Forward an upstream progress update to the downstream caller.
 
@@ -2025,7 +2102,7 @@ async def call_tool(
     mcp_session_id = None
     if request_headers:
         request_headers_lower = {k.lower(): v for k, v in request_headers.items()}
-        mcp_session_id = request_headers_lower.get("x-mcp-session-id") or request_headers_lower.get("mcp-session-id")
+        mcp_session_id = catalog_session_id(request_headers_lower)
     if settings.mcpgateway_session_affinity_enabled and mcp_session_id:
         try:
             # First-Party
@@ -2677,6 +2754,8 @@ async def list_tools() -> List[types.Tool]:
     """
     Lists all tools available to the MCP Server.
 
+    Compatibility API. Registered MCP adapters use ``list_catalog_page()``.
+
     Supports two modes based on gateway's gateway_mode:
     - 'cache': Returns tools from database (default behavior)
     - 'direct_proxy': Proxies the request directly to the remote MCP server
@@ -2781,6 +2860,8 @@ async def list_tools() -> List[types.Tool]:
 async def list_prompts() -> List[types.Prompt]:
     """
     Lists all prompts available to the MCP Server.
+
+    Compatibility API. Registered MCP adapters use ``list_catalog_page()``.
 
     Returns:
         A list of Prompt objects containing metadata such as name, description, and arguments.
@@ -2901,6 +2982,8 @@ async def get_prompt(prompt_id: str, arguments: dict[str, str] | None = None) ->
         # request_context might not be active in some edge cases (e.g. tests)
         logger.debug("No active request context found")
 
+    _reject_invalid_meta(meta_data)
+
     # Cross-hook plugin state sharing on /mcp (issue #3879).
     plugin_global_context, plugin_context_table = _get_plugin_contexts_or_none()
 
@@ -2926,7 +3009,7 @@ async def get_prompt(prompt_id: str, arguments: dict[str, str] | None = None) ->
                 raise MCPError(code=types.INVALID_PARAMS, message=str(e)) from e
             except PromptUpstreamError as e:
                 logger.info("Upstream answered prompt %s with JSON-RPC error %s", prompt_id, e.code)
-                raise MCPError(code=e.code, message=str(e), data=e.data) from e
+                raise MCPError(code=_relayed_upstream_code(e.code), message=str(e), data=e.data) from e
             if not result or not result.messages:
                 logger.warning("No content returned by prompt: %s", prompt_id)
                 return types.GetPromptResult(messages=[])
@@ -2943,6 +3026,8 @@ async def get_prompt(prompt_id: str, arguments: dict[str, str] | None = None) ->
 async def list_resources() -> List[types.Resource]:
     """
     Lists all resources available to the MCP Server.
+
+    Compatibility API. Registered MCP adapters use ``list_catalog_page()``.
 
     Returns:
         A list of Resource objects containing metadata such as uri, name, description, and mimeType.
@@ -3101,6 +3186,8 @@ async def read_resource(resource_uri: str) -> Union[str, bytes, List[Any]]:
         # request_context might not be active in some edge cases (e.g. tests)
         logger.debug("No active request context found")
 
+    _reject_invalid_meta(meta_data)
+
     # Cross-hook plugin state sharing on /mcp (issue #3879).
     plugin_global_context, plugin_context_table = _get_plugin_contexts_or_none()
 
@@ -3130,8 +3217,6 @@ async def read_resource(resource_uri: str) -> Union[str, bytes, List[Any]]:
                         GATEWAY_ID_HEADER,
                         sorted(meta_data.keys()) if meta_data else None,
                     )
-                    # CWE-400: validate _meta limits before network I/O (bypassed in direct-proxy branch)
-                    _validate_meta_data(meta_data)
                     contents = await _proxy_read_resource_to_gateway(gateway, str(resource_uri), user_context, meta_data)
                     if contents:
                         # Return first content (text or blob)
@@ -3158,6 +3243,9 @@ async def read_resource(resource_uri: str) -> Union[str, bytes, List[Any]]:
             except ResourceNotFoundError as e:
                 logger.info("Unknown resource requested: %s", resource_uri)
                 raise MCPError(code=types.INVALID_PARAMS, message=f"Unknown resource: {resource_uri}") from e
+            except ResourceUpstreamError as e:
+                logger.info("Upstream answered resource %s with JSON-RPC error %s", resource_uri, e.code)
+                raise MCPError(code=_relayed_upstream_code(e.code), message=str(e), data=e.data) from e
             except ValueError as e:
                 if str(e) != "Resource has no content":
                     raise
@@ -3187,6 +3275,8 @@ async def read_resource(resource_uri: str) -> Union[str, bytes, List[Any]]:
 async def list_resource_templates() -> List[Dict[str, Any]]:
     """
     Lists all resource templates available to the MCP Server.
+
+    Compatibility API. Registered MCP adapters use ``list_catalog_page()``.
 
     Returns:
         List[types.ResourceTemplate]: A list of resource templates with their URIs and metadata.
@@ -3538,12 +3628,58 @@ async def _adapt_discover_with_ttl_cache_scope(ctx: Any, params: Any = None) -> 
         _v2_request_ctx.reset(token)
 
 
+async def _list_catalog_page(method: str, params: Any) -> dict[str, Any]:
+    """Authorize and serve one MCP catalog page.
+
+    Args:
+        method: MCP list method.
+        params: SDK pagination parameters.
+
+    Returns:
+        A bounded MCP list result.
+
+    Raises:
+        PermissionError: If the token excludes the list permission.
+        MCPError: If pagination fails.
+    """
+    # First-Party
+    from mcpgateway.auth_context import get_scoped_visibility_from_user_context  # pylint: disable=import-outside-toplevel
+
+    server_id, headers, user_context = await _get_request_context_or_default()
+    permission = {"tools/list": "tools.read", "prompts/list": "prompts.read"}.get(method, "resources.read")
+    if _should_enforce_streamable_rbac(user_context) and not _check_scoped_permission(user_context, permission):
+        raise PermissionError(_ACCESS_DENIED_MSG)
+    if not settings.mcp_require_auth:
+        await _check_server_oauth_enforcement(server_id, user_context)
+    user_email, token_teams = get_scoped_visibility_from_user_context(user_context)
+    meta = getattr(params, "meta", None) if params is not None else None
+    try:
+        async with get_db() as db:
+            payload = await list_catalog_page(
+                db,
+                method,
+                cursor=getattr(params, "cursor", None),
+                server_id=server_id,
+                user_email=user_email,
+                token_teams=token_teams,
+                request_headers=headers,
+                meta=meta,
+                model_items=True,
+            )
+            db.commit()
+            return payload
+    except JSONRPCError as exc:
+        raise MCPError(code=exc.code, message=exc.message) from exc
+
+
 async def _adapt_list_tools(ctx: Any, _params: Any = None) -> "types.ListToolsResult":
-    """v2 (ctx, params) -> v1 list_tools() -> ListToolsResult."""
+    """Serve one paginated tools/list result through the v2 handler."""
     token = _v2_request_ctx.set(ctx)
     try:
-        tools = _tools_for_caller(await list_tools())
-        return types.ListToolsResult(tools=tools, ttl_ms=await _catalog_ttl_ms(_request_server_id_var.get()), cache_scope="private")
+        payload = await _list_catalog_page("tools/list", _params)
+        result = types.ListToolsResult(**payload, ttl_ms=await _catalog_ttl_ms(_request_server_id_var.get()), cache_scope="private")
+        result.tools = _tools_for_caller(result.tools)
+        return result
     finally:
         _v2_request_ctx.reset(token)
 
@@ -3572,11 +3708,11 @@ async def _adapt_call_tool(ctx: Any, params: Any) -> "types.CallToolResult":
 
 
 async def _adapt_list_prompts(ctx: Any, _params: Any = None) -> "types.ListPromptsResult":
-    """v2 (ctx, params) -> v1 list_prompts() -> ListPromptsResult."""
+    """Serve one paginated prompts/list result through the v2 handler."""
     token = _v2_request_ctx.set(ctx)
     try:
-        prompts = await list_prompts()
-        return types.ListPromptsResult(prompts=prompts, ttl_ms=await _catalog_ttl_ms(_request_server_id_var.get()), cache_scope="private")
+        payload = await _list_catalog_page("prompts/list", _params)
+        return types.ListPromptsResult(**payload, ttl_ms=await _catalog_ttl_ms(_request_server_id_var.get()), cache_scope="private")
     finally:
         _v2_request_ctx.reset(token)
 
@@ -3592,11 +3728,11 @@ async def _adapt_get_prompt(ctx: Any, params: Any) -> "types.GetPromptResult":
 
 
 async def _adapt_list_resources(ctx: Any, _params: Any = None) -> "types.ListResourcesResult":
-    """v2 (ctx, params) -> v1 list_resources() -> ListResourcesResult."""
+    """Serve one paginated resources/list result through the v2 handler."""
     token = _v2_request_ctx.set(ctx)
     try:
-        resources = await list_resources()
-        return types.ListResourcesResult(resources=resources, ttl_ms=await _catalog_ttl_ms(_request_server_id_var.get()), cache_scope="private")
+        payload = await _list_catalog_page("resources/list", _params)
+        return types.ListResourcesResult(**payload, ttl_ms=await _catalog_ttl_ms(_request_server_id_var.get()), cache_scope="private")
     finally:
         _v2_request_ctx.reset(token)
 
@@ -3634,15 +3770,11 @@ async def _adapt_read_resource(ctx: Any, params: Any) -> "types.ReadResourceResu
 
 
 async def _adapt_list_resource_templates(ctx: Any, _params: Any = None) -> "types.ListResourceTemplatesResult":
-    """v2 (ctx, params) -> v1 list_resource_templates() -> ListResourceTemplatesResult.
-
-    v1 returns ``List[Dict[str, Any]]``; coerce to ``ResourceTemplate`` models.
-    """
+    """Serve one paginated resources/templates/list result through the v2 handler."""
     token = _v2_request_ctx.set(ctx)
     try:
-        raw_templates = await list_resource_templates()
-        templates = [types.ResourceTemplate.model_validate(t) if isinstance(t, dict) else t for t in raw_templates]
-        return types.ListResourceTemplatesResult(resourceTemplates=templates, ttl_ms=await _catalog_ttl_ms(_request_server_id_var.get()), cache_scope="private")
+        payload = await _list_catalog_page("resources/templates/list", _params)
+        return types.ListResourceTemplatesResult(**payload, ttl_ms=await _catalog_ttl_ms(_request_server_id_var.get()), cache_scope="private")
     finally:
         _v2_request_ctx.reset(token)
 
@@ -4696,15 +4828,14 @@ class SessionManagerWrapper:
 
         # Internal-forward bypass: only valid when session-affinity is enabled (the sole code path
         # that sets x-forwarded-internally). Gate on loopback source to prevent external spoofing.
-        # Origin/Host checks are enforced at the /mcp mount level (main.py MCPOriginHostGate) so
-        # that all ingress shapes — Python, rust-internal, and rust-public — are covered by a single
-        # gate without duplicating the logic here.
+        # Origin/Host checks are enforced at the /mcp mount level (MCPOriginHostGate),
+        # so the logic is not duplicated here.
         _client = scope.get("client")
         _client_host = _client[0] if _client else None
         is_internally_forwarded = settings.mcpgateway_session_affinity_enabled and _client_host in ("127.0.0.1", "::1") and headers.get("x-forwarded-internally") == "true"
 
         # Log session info for debugging stateful sessions
-        mcp_session_id = headers.get("x-mcp-session-id") or headers.get("mcp-session-id") or "not-provided"
+        mcp_session_id = catalog_session_id(headers) or "not-provided"
         if mcp_session_id != "not-provided":
             set_trace_session_id(mcp_session_id)
         method = scope.get("method", "UNKNOWN")
@@ -4942,6 +5073,8 @@ class SessionManagerWrapper:
                 from mcpgateway.utils.passthrough_headers import safe_extract_and_filter_for_loopback  # pylint: disable=import-outside-toplevel
 
                 rpc_headers.update(safe_extract_and_filter_for_loopback(headers))
+                if gateway_id := extract_gateway_id_from_headers(headers):
+                    rpc_headers[GATEWAY_ID_HEADER.lower()] = gateway_id
 
                 # Dispatch IN-PROCESS to the trusted internal endpoint so it executes in
                 # this worker (the session owner) rather than scattering over the shared
@@ -5137,6 +5270,8 @@ class SessionManagerWrapper:
                             rpc_headers[_auth_header_name] = _original_auth
                         # Forward passthrough headers for upstream MCP servers (see #3640).
                         rpc_headers.update(safe_extract_and_filter_for_loopback(headers))
+                        if gateway_id := extract_gateway_id_from_headers(headers):
+                            rpc_headers[GATEWAY_ID_HEADER.lower()] = gateway_id
 
                         # Dispatch in-process so the request runs on this worker, the
                         # session owner that holds the bound upstream session, instead of

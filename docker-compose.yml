@@ -167,8 +167,8 @@ services:
       - A2A_RUST_EVENT_FLUSH_BATCH_SIZE=${A2A_RUST_EVENT_FLUSH_BATCH_SIZE:-100}
       # MCP Apps UI support (disabled by default; opt-in only)
       - MCPGATEWAY_MCP_APPS_ENABLED=${MCPGATEWAY_MCP_APPS_ENABLED:-false}
-      # Inbound MCP protocol mode (legacy by default; set auto to accept 2026-07-28 clients)
-      - MCP_INBOUND_PROTOCOL_MODE=${MCP_INBOUND_PROTOCOL_MODE:-legacy}
+      # Inbound MCP protocol mode (auto by default, accepts 2026-07-28 clients; set legacy to accept only handshake-era versions)
+      - MCP_INBOUND_PROTOCOL_MODE=${MCP_INBOUND_PROTOCOL_MODE:-auto}
       # WebSocket transport features (disabled by default; opt-in only)
       - MCPGATEWAY_WS_RELAY_ENABLED=${MCPGATEWAY_WS_RELAY_ENABLED:-false}
       - MCPGATEWAY_REVERSE_PROXY_ENABLED=${MCPGATEWAY_REVERSE_PROXY_ENABLED:-false}
@@ -284,6 +284,12 @@ services:
       # - BASIC_AUTH_PASSWORD=${BASIC_AUTH_PASSWORD:-changeme}  # pragma: allowlist secret
       # Auth encryption secret + default user password
       - "AUTH_ENCRYPTION_SECRET=${AUTH_ENCRYPTION_SECRET:?AUTH_ENCRYPTION_SECRET is not set. Run: make setup (if .env does not exist) or make init-secrets-patch-env (if .env exists)}"
+      - MCP_LIST_PAGE_SIZE=${MCP_LIST_PAGE_SIZE:-100}
+      - MCP_LIST_CURSOR_TTL_SECONDS=${MCP_LIST_CURSOR_TTL_SECONDS:-900}
+      - MCP_PROXY_LIST_MAX_SNAPSHOT_BYTES=${MCP_PROXY_LIST_MAX_SNAPSHOT_BYTES:-67108864}
+      - MCP_PROXY_LIST_MAX_TOTAL_BYTES=${MCP_PROXY_LIST_MAX_TOTAL_BYTES:-134217728}
+      - MCP_PROXY_LIST_MAX_COLLECTORS=${MCP_PROXY_LIST_MAX_COLLECTORS:-32}
+      - MCP_PROXY_LIST_MAX_SNAPSHOTS=${MCP_PROXY_LIST_MAX_SNAPSHOTS:-64}
       - "DEFAULT_USER_PASSWORD=${DEFAULT_USER_PASSWORD:?DEFAULT_USER_PASSWORD is not set. Run: make setup (if .env does not exist) or make init-secrets-patch-env (if .env exists)}"
       # Admin UI uses email/password authentication
       - EMAIL_AUTH_ENABLED=true
@@ -1015,6 +1021,12 @@ services:
       - "DEFAULT_USER_PASSWORD=${DEFAULT_USER_PASSWORD:?DEFAULT_USER_PASSWORD is not set. Run: make setup (if .env does not exist) or make init-secrets-patch-env (if .env exists)}"
       - AUTH_REQUIRED=${AUTH_REQUIRED:-true}
       - "AUTH_ENCRYPTION_SECRET=${AUTH_ENCRYPTION_SECRET:?AUTH_ENCRYPTION_SECRET is not set. Run: make setup (if .env does not exist) or make init-secrets-patch-env (if .env exists)}"
+      - MCP_LIST_PAGE_SIZE=${MCP_LIST_PAGE_SIZE:-100}
+      - MCP_LIST_CURSOR_TTL_SECONDS=${MCP_LIST_CURSOR_TTL_SECONDS:-900}
+      - MCP_PROXY_LIST_MAX_SNAPSHOT_BYTES=${MCP_PROXY_LIST_MAX_SNAPSHOT_BYTES:-67108864}
+      - MCP_PROXY_LIST_MAX_TOTAL_BYTES=${MCP_PROXY_LIST_MAX_TOTAL_BYTES:-134217728}
+      - MCP_PROXY_LIST_MAX_COLLECTORS=${MCP_PROXY_LIST_MAX_COLLECTORS:-32}
+      - MCP_PROXY_LIST_MAX_SNAPSHOTS=${MCP_PROXY_LIST_MAX_SNAPSHOTS:-64}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     command: ["python", "-m", "mcpgateway.bootstrap_db"]
     depends_on:
@@ -1139,7 +1151,7 @@ services:
     # service holds user sessions/auth, so an unexpected code swap matters.
     # Bump both together on release (see release-management.md #6.4); get the
     # digest with: docker buildx imagetools inspect <image>:<tag>
-    image: ${WEB_UI_IMAGE:-ghcr.io/contextforge-org/contextforge-web-ui:0.2.1@sha256:e2063ab012e7fe78815c5f840d517e1cc1fd484ed25c7b8e37cd78210cc3ab98}
+    image: ${WEB_UI_IMAGE:-ghcr.io/contextforge-org/contextforge-web-ui:0.2.4@sha256:60587b6dd81be22c8d7ce76b1595b8b67c209674f67b9fedf387d8aa1d6ada6f}
     restart: unless-stopped
     ports:
       # Host and container port tied together on purpose - the image reads
@@ -1273,6 +1285,12 @@ services:
     environment:
       - "JWT_SECRET_KEY=${JWT_SECRET_KEY:?JWT_SECRET_KEY is not set. Run: make setup (first time) or make init-secrets-patch-env (if .env exists)}"
       - "AUTH_ENCRYPTION_SECRET=${AUTH_ENCRYPTION_SECRET:?AUTH_ENCRYPTION_SECRET is not set. Run: make setup (if .env does not exist) or make init-secrets-patch-env (if .env exists)}"
+      - MCP_LIST_PAGE_SIZE=${MCP_LIST_PAGE_SIZE:-100}
+      - MCP_LIST_CURSOR_TTL_SECONDS=${MCP_LIST_CURSOR_TTL_SECONDS:-900}
+      - MCP_PROXY_LIST_MAX_SNAPSHOT_BYTES=${MCP_PROXY_LIST_MAX_SNAPSHOT_BYTES:-67108864}
+      - MCP_PROXY_LIST_MAX_TOTAL_BYTES=${MCP_PROXY_LIST_MAX_TOTAL_BYTES:-134217728}
+      - MCP_PROXY_LIST_MAX_COLLECTORS=${MCP_PROXY_LIST_MAX_COLLECTORS:-32}
+      - MCP_PROXY_LIST_MAX_SNAPSHOTS=${MCP_PROXY_LIST_MAX_SNAPSHOTS:-64}
       # create_jwt_token instantiates Settings(), which fails closed on the default "changeme"
       # platform_admin_password/default_user_password once email_auth_enabled (default true).
       - "PLATFORM_ADMIN_PASSWORD=${PLATFORM_ADMIN_PASSWORD:?PLATFORM_ADMIN_PASSWORD is not set. Run: make setup (if .env does not exist) or make init-secrets-patch-env (if .env exists)}"
@@ -1529,6 +1547,12 @@ services:
     environment:
       - "JWT_SECRET_KEY=${JWT_SECRET_KEY:?JWT_SECRET_KEY is not set. Run: make setup (first time) or make init-secrets-patch-env (if .env exists)}"
       - "AUTH_ENCRYPTION_SECRET=${AUTH_ENCRYPTION_SECRET:?AUTH_ENCRYPTION_SECRET is not set. Run: make setup (if .env does not exist) or make init-secrets-patch-env (if .env exists)}"
+      - MCP_LIST_PAGE_SIZE=${MCP_LIST_PAGE_SIZE:-100}
+      - MCP_LIST_CURSOR_TTL_SECONDS=${MCP_LIST_CURSOR_TTL_SECONDS:-900}
+      - MCP_PROXY_LIST_MAX_SNAPSHOT_BYTES=${MCP_PROXY_LIST_MAX_SNAPSHOT_BYTES:-67108864}
+      - MCP_PROXY_LIST_MAX_TOTAL_BYTES=${MCP_PROXY_LIST_MAX_TOTAL_BYTES:-134217728}
+      - MCP_PROXY_LIST_MAX_COLLECTORS=${MCP_PROXY_LIST_MAX_COLLECTORS:-32}
+      - MCP_PROXY_LIST_MAX_SNAPSHOTS=${MCP_PROXY_LIST_MAX_SNAPSHOTS:-64}
       # create_jwt_token instantiates Settings(), which fails closed on the default "changeme"
       # platform_admin_password/default_user_password once email_auth_enabled (default true).
       - "PLATFORM_ADMIN_PASSWORD=${PLATFORM_ADMIN_PASSWORD:?PLATFORM_ADMIN_PASSWORD is not set. Run: make setup (if .env does not exist) or make init-secrets-patch-env (if .env exists)}"
@@ -1903,6 +1927,12 @@ services:
     environment:
       - "JWT_SECRET_KEY=${JWT_SECRET_KEY:?JWT_SECRET_KEY is not set. Run: make setup (first time) or make init-secrets-patch-env (if .env exists)}"
       - "AUTH_ENCRYPTION_SECRET=${AUTH_ENCRYPTION_SECRET:?AUTH_ENCRYPTION_SECRET is not set. Run: make setup (if .env does not exist) or make init-secrets-patch-env (if .env exists)}"
+      - MCP_LIST_PAGE_SIZE=${MCP_LIST_PAGE_SIZE:-100}
+      - MCP_LIST_CURSOR_TTL_SECONDS=${MCP_LIST_CURSOR_TTL_SECONDS:-900}
+      - MCP_PROXY_LIST_MAX_SNAPSHOT_BYTES=${MCP_PROXY_LIST_MAX_SNAPSHOT_BYTES:-67108864}
+      - MCP_PROXY_LIST_MAX_TOTAL_BYTES=${MCP_PROXY_LIST_MAX_TOTAL_BYTES:-134217728}
+      - MCP_PROXY_LIST_MAX_COLLECTORS=${MCP_PROXY_LIST_MAX_COLLECTORS:-32}
+      - MCP_PROXY_LIST_MAX_SNAPSHOTS=${MCP_PROXY_LIST_MAX_SNAPSHOTS:-64}
       # create_jwt_token instantiates Settings(), which fails closed on the default "changeme"
       # platform_admin_password/default_user_password once email_auth_enabled (default true).
       - "PLATFORM_ADMIN_PASSWORD=${PLATFORM_ADMIN_PASSWORD:?PLATFORM_ADMIN_PASSWORD is not set. Run: make setup (if .env does not exist) or make init-secrets-patch-env (if .env exists)}"
@@ -2028,6 +2058,12 @@ services:
     environment:
       - "JWT_SECRET_KEY=${JWT_SECRET_KEY:?JWT_SECRET_KEY is not set. Run: make setup (first time) or make init-secrets-patch-env (if .env exists)}"
       - "AUTH_ENCRYPTION_SECRET=${AUTH_ENCRYPTION_SECRET:?AUTH_ENCRYPTION_SECRET is not set. Run: make setup (if .env does not exist) or make init-secrets-patch-env (if .env exists)}"
+      - MCP_LIST_PAGE_SIZE=${MCP_LIST_PAGE_SIZE:-100}
+      - MCP_LIST_CURSOR_TTL_SECONDS=${MCP_LIST_CURSOR_TTL_SECONDS:-900}
+      - MCP_PROXY_LIST_MAX_SNAPSHOT_BYTES=${MCP_PROXY_LIST_MAX_SNAPSHOT_BYTES:-67108864}
+      - MCP_PROXY_LIST_MAX_TOTAL_BYTES=${MCP_PROXY_LIST_MAX_TOTAL_BYTES:-134217728}
+      - MCP_PROXY_LIST_MAX_COLLECTORS=${MCP_PROXY_LIST_MAX_COLLECTORS:-32}
+      - MCP_PROXY_LIST_MAX_SNAPSHOTS=${MCP_PROXY_LIST_MAX_SNAPSHOTS:-64}
       # create_jwt_token instantiates Settings(), which fails closed on the default "changeme"
       # platform_admin_password/default_user_password once email_auth_enabled (default true).
       - "PLATFORM_ADMIN_PASSWORD=${PLATFORM_ADMIN_PASSWORD:?PLATFORM_ADMIN_PASSWORD is not set. Run: make setup (if .env does not exist) or make init-secrets-patch-env (if .env exists)}"
@@ -2104,6 +2140,12 @@ services:
     environment:
       - "JWT_SECRET_KEY=${JWT_SECRET_KEY:?JWT_SECRET_KEY is not set. Run: make setup (first time) or make init-secrets-patch-env (if .env exists)}"
       - "AUTH_ENCRYPTION_SECRET=${AUTH_ENCRYPTION_SECRET:?AUTH_ENCRYPTION_SECRET is not set. Run: make setup (if .env does not exist) or make init-secrets-patch-env (if .env exists)}"
+      - MCP_LIST_PAGE_SIZE=${MCP_LIST_PAGE_SIZE:-100}
+      - MCP_LIST_CURSOR_TTL_SECONDS=${MCP_LIST_CURSOR_TTL_SECONDS:-900}
+      - MCP_PROXY_LIST_MAX_SNAPSHOT_BYTES=${MCP_PROXY_LIST_MAX_SNAPSHOT_BYTES:-67108864}
+      - MCP_PROXY_LIST_MAX_TOTAL_BYTES=${MCP_PROXY_LIST_MAX_TOTAL_BYTES:-134217728}
+      - MCP_PROXY_LIST_MAX_COLLECTORS=${MCP_PROXY_LIST_MAX_COLLECTORS:-32}
+      - MCP_PROXY_LIST_MAX_SNAPSHOTS=${MCP_PROXY_LIST_MAX_SNAPSHOTS:-64}
       # create_jwt_token instantiates Settings(), which fails closed on the default "changeme"
       # platform_admin_password/default_user_password once email_auth_enabled (default true).
       - "PLATFORM_ADMIN_PASSWORD=${PLATFORM_ADMIN_PASSWORD:?PLATFORM_ADMIN_PASSWORD is not set. Run: make setup (if .env does not exist) or make init-secrets-patch-env (if .env exists)}"
@@ -2279,6 +2321,12 @@ services:
     environment:
       - "JWT_SECRET_KEY=${JWT_SECRET_KEY:?JWT_SECRET_KEY is not set. Run: make setup (first time) or make init-secrets-patch-env (if .env exists)}"
       - "AUTH_ENCRYPTION_SECRET=${AUTH_ENCRYPTION_SECRET:?AUTH_ENCRYPTION_SECRET is not set. Run: make setup (if .env does not exist) or make init-secrets-patch-env (if .env exists)}"
+      - MCP_LIST_PAGE_SIZE=${MCP_LIST_PAGE_SIZE:-100}
+      - MCP_LIST_CURSOR_TTL_SECONDS=${MCP_LIST_CURSOR_TTL_SECONDS:-900}
+      - MCP_PROXY_LIST_MAX_SNAPSHOT_BYTES=${MCP_PROXY_LIST_MAX_SNAPSHOT_BYTES:-67108864}
+      - MCP_PROXY_LIST_MAX_TOTAL_BYTES=${MCP_PROXY_LIST_MAX_TOTAL_BYTES:-134217728}
+      - MCP_PROXY_LIST_MAX_COLLECTORS=${MCP_PROXY_LIST_MAX_COLLECTORS:-32}
+      - MCP_PROXY_LIST_MAX_SNAPSHOTS=${MCP_PROXY_LIST_MAX_SNAPSHOTS:-64}
       # create_jwt_token instantiates Settings(), which fails closed on the default "changeme"
       # platform_admin_password/default_user_password once email_auth_enabled (default true).
       - "PLATFORM_ADMIN_PASSWORD=${PLATFORM_ADMIN_PASSWORD:?PLATFORM_ADMIN_PASSWORD is not set. Run: make setup (if .env does not exist) or make init-secrets-patch-env (if .env exists)}"
