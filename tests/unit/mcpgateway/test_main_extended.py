@@ -114,7 +114,7 @@ from mcpgateway.main import (
     validate_security_configuration,
 )
 from mcpgateway.middleware.token_scoping import ResourceOwnershipResult
-from mcpgateway.schemas import PromptCreate, PromptUpdate, ResourceCreate, ResourceUpdate, ToolCreate, ToolUpdate
+from mcpgateway.schemas import PromptCreate, PromptUpdate, ResourceCreate, ResourceUpdate, ServerCreate, ServerCreateRequest, ToolCreate, ToolUpdate
 from mcpgateway.services.tool_service import ToolError, ToolNotFoundError, ToolUnavailableError
 from mcpgateway.transports.streamablehttp_transport import user_context_var
 from mcpgateway.validation.jsonrpc import JSONRPCError
@@ -662,6 +662,7 @@ class TestMcpSerialization:
 
     def test_serialize_mcp_tool_definition_gets_title_from_object_attr(self):
         """title should be extractable via getattr for non-dict objects."""
+
         class FakeTool:
             name = "fake-tool"
             title = "Fake Tool Title"
@@ -1807,7 +1808,7 @@ class TestAdminAuthMiddleware:
         mock_auth_service.get_user_by_email = AsyncMock(return_value=mock_user)
         mock_permission_service = MagicMock()
         mock_permission_service.has_admin_permission = AsyncMock(return_value=True)
-        request.state.token_teams = ["a1b2c3d4e5f6789012345678abcdef01"]
+        request.state.token_teams = ["a1b2c3d4e5f6789012345678abcdef01"]  # pragma: allowlist secret
 
         with (
             patch("mcpgateway.main.get_db", _db_gen),
@@ -2137,7 +2138,7 @@ class TestAdminAuthMiddleware:
         request = _make_request(
             "/admin/tools",
             headers={"Authorization": "Bearer token"},
-            query_params={"team_id": "a1b2c3d4e5f6789012345678abcdef01"},
+            query_params={"team_id": "a1b2c3d4e5f6789012345678abcdef01"},  # pragma: allowlist secret
         )
         request.state.token_teams = ["a1b2c3d4e5f6789012345678abcdef01", "fedcba9876543210fedcba9876543210"]  # pragma: allowlist secret
         call_next = AsyncMock(return_value="ok")
@@ -2181,7 +2182,7 @@ class TestAdminAuthMiddleware:
             headers={"Authorization": "Bearer token"},
             query_params={"team_id": "00000000000000000000000000000099"},
         )
-        request.state.token_teams = ["a1b2c3d4e5f6789012345678abcdef01"]
+        request.state.token_teams = ["a1b2c3d4e5f6789012345678abcdef01"]  # pragma: allowlist secret
         call_next = AsyncMock(return_value="ok")
 
         monkeypatch.setattr(settings, "auth_required", True)
@@ -2211,7 +2212,7 @@ class TestAdminAuthMiddleware:
 
         assert response.status_code == 403
         # team_id was not in token_teams, so should pass None
-        mock_permission_service.has_admin_permission.assert_awaited_once_with("dev@example.com", team_id=None, token_teams=["a1b2c3d4e5f6789012345678abcdef01"])
+        mock_permission_service.has_admin_permission.assert_awaited_once_with("dev@example.com", team_id=None, token_teams=["a1b2c3d4e5f6789012345678abcdef01"])  # pragma: allowlist secret
 
     @pytest.mark.asyncio
     async def test_admin_auth_no_team_id_uses_global_check(self, monkeypatch):
@@ -2221,7 +2222,7 @@ class TestAdminAuthMiddleware:
             "/admin/tools",
             headers={"Authorization": "Bearer token"},
         )
-        request.state.token_teams = ["a1b2c3d4e5f6789012345678abcdef01"]
+        request.state.token_teams = ["a1b2c3d4e5f6789012345678abcdef01"]  # pragma: allowlist secret
         call_next = AsyncMock(return_value="ok")
 
         monkeypatch.setattr(settings, "auth_required", True)
@@ -2250,7 +2251,7 @@ class TestAdminAuthMiddleware:
 
         assert response == "ok"
         # No team_id in request, so should pass None
-        mock_permission_service.has_admin_permission.assert_awaited_once_with("dev@example.com", team_id=None, token_teams=["a1b2c3d4e5f6789012345678abcdef01"])
+        mock_permission_service.has_admin_permission.assert_awaited_once_with("dev@example.com", team_id=None, token_teams=["a1b2c3d4e5f6789012345678abcdef01"])  # pragma: allowlist secret
 
     @pytest.mark.asyncio
     async def test_admin_auth_empty_string_team_id_ignored(self, monkeypatch):
@@ -6411,6 +6412,8 @@ class TestRpcHandling:
             {"session_id": "sess-1", "protocolVersion": "2025-11-25"},
             session_id="sess-1",
             server_id="srv-1",
+            user_email="user@example.com",
+            token_teams=["team-a"],
         )
 
     async def test_handle_internal_mcp_initialize_rejects_session_owner_mismatch(self, monkeypatch):
@@ -10137,9 +10140,7 @@ class TestExportImportEndpoints:
         monkeypatch.setattr(main_mod, "is_unrestricted_platform_admin", AsyncMock(return_value=False))
 
         with pytest.raises(HTTPException) as excinfo:
-            await main_mod.export_selective_configuration.__wrapped__(
-                MagicMock(spec=Request), {"roots": ["https://example.com/root"]}, db=MagicMock(), user={"email": "admin@example.com"}
-            )
+            await main_mod.export_selective_configuration.__wrapped__(MagicMock(spec=Request), {"roots": ["https://example.com/root"]}, db=MagicMock(), user={"email": "admin@example.com"})
 
         assert excinfo.value.status_code == 403
         assert excinfo.value.detail == main_mod._ACCESS_DENIED_MSG
@@ -10184,7 +10185,9 @@ class TestExportImportEndpoints:
         import_data = {"entities": {"roots": [{"uri": "https://example.com/root", "name": "Root"}]}}
 
         with pytest.raises(HTTPException) as excinfo:
-            await main_mod.import_configuration.__wrapped__(import_data=import_data, conflict_strategy="update", dry_run=dry_run, selected_entities=None, db=MagicMock(), user={"email": "admin@example.com"})
+            await main_mod.import_configuration.__wrapped__(
+                import_data=import_data, conflict_strategy="update", dry_run=dry_run, selected_entities=None, db=MagicMock(), user={"email": "admin@example.com"}
+            )
 
         assert excinfo.value.status_code == 403
         assert excinfo.value.detail == main_mod._ACCESS_DENIED_MSG
@@ -10201,7 +10204,9 @@ class TestExportImportEndpoints:
         monkeypatch.setattr(main_mod, "import_service", import_service)
         monkeypatch.setattr(main_mod, "is_unrestricted_platform_admin", AsyncMock(return_value=False))
 
-        result = await main_mod.import_configuration.__wrapped__(import_data={"entities": {"tools": []}}, conflict_strategy="update", dry_run=dry_run, selected_entities=None, db=MagicMock(), user={"email": "admin@example.com"})
+        result = await main_mod.import_configuration.__wrapped__(
+            import_data={"entities": {"tools": []}}, conflict_strategy="update", dry_run=dry_run, selected_entities=None, db=MagicMock(), user={"email": "admin@example.com"}
+        )
 
         assert result == {"status": "ok"}
         import_service.import_configuration.assert_awaited_once()
@@ -10876,13 +10881,11 @@ class TestRemainingCoverageGaps:
 
         request = _make_request("/servers")
         request.state = SimpleNamespace(team_id="team-1", token_teams=[])
-        server_obj = MagicMock()
+        server_obj = MagicMock(team_id=None, visibility=None)
 
         response = await main_mod.create_server.__wrapped__(
-            server_obj,
+            ServerCreateRequest(server=ServerCreate(name="s"), team_id=None, visibility="team"),
             request,
-            team_id=None,
-            visibility="team",
             db=MagicMock(),
             user={"email": "user@example.com"},
         )
@@ -10890,10 +10893,8 @@ class TestRemainingCoverageGaps:
 
         request.state = SimpleNamespace(team_id="team-1", token_teams=["team-1"])
         response = await main_mod.create_server.__wrapped__(
-            server_obj,
+            ServerCreateRequest(server=ServerCreate(name="s"), team_id="team-2", visibility="team"),
             request,
-            team_id="team-2",
-            visibility="team",
             db=MagicMock(),
             user={"email": "user@example.com"},
         )
@@ -10916,10 +10917,8 @@ class TestRemainingCoverageGaps:
         monkeypatch.setattr(main_mod.server_service, "register_server", register)
         db = MagicMock()
         _ = await main_mod.create_server.__wrapped__(
-            server_obj,
+            ServerCreateRequest(server=ServerCreate(name="s"), team_id="team-1", visibility="public"),
             request,
-            team_id="team-1",
-            visibility="public",
             db=db,
             user={"email": "user@example.com"},
         )
@@ -11934,6 +11933,60 @@ class TestRemainingCoverageGaps:
         assert "version" not in info
         assert "admin_api_enabled" not in info
 
+    @pytest.mark.parametrize("variant", ["features_off", "features_on", "degraded_baggage"])
+    def test_module_level_middleware_registration_branches(self, monkeypatch, variant):
+        """Exercise the middleware registration gates against a bare app.
+
+        Runs ``_register_middleware`` under three settings matrices. The matrix
+        covers both outcomes of each middleware gate without re-executing the
+        module.
+        """
+        # Third-Party
+        from fastapi import FastAPI
+
+        # First-Party
+        import mcpgateway.main as main_module
+
+        overrides = {
+            "environment": "production",
+            "allowed_origins": [],
+            "compression_enabled": False,
+            "validation_middleware_enabled": False,
+            "token_usage_logging_enabled": False,
+            "email_auth_enabled": False,
+            "security_logging_enabled": True,
+            "observability_enabled": True,
+            "db_query_log_enabled": True,
+        }
+        if variant == "features_on":
+            overrides.update(
+                {
+                    "validation_middleware_enabled": True,
+                    "token_usage_logging_enabled": True,
+                    "otel_baggage_enabled": True,
+                }
+            )
+            monkeypatch.setattr(main_module, "otel_tracing_enabled", lambda: True)
+        elif variant == "degraded_baggage":
+            overrides["otel_baggage_enabled"] = True
+            monkeypatch.setattr(main_module, "otel_tracing_enabled", lambda: False)
+
+        for key, value in overrides.items():
+            monkeypatch.setattr(settings, key, value, raising=False)
+        monkeypatch.setattr("mcpgateway.middleware.db_query_logging.setup_query_logging", lambda *_a, **_k: None, raising=False)
+
+        bare_app = FastAPI()
+        main_module._register_middleware(bare_app)  # pylint: disable=protected-access
+
+        names = [mw.cls.__name__ for mw in bare_app.user_middleware]
+        if variant == "features_on":
+            assert "ValidationMiddleware" in names
+            assert "TokenUsageMiddleware" in names
+            assert "BaggageMiddleware" in names
+        else:
+            assert "ValidationMiddleware" not in names
+            assert "BaggageMiddleware" not in names
+
     def test_jsonpath_modifier_defaults_when_jsonpath_missing(self):
         # jsonpath_modifier(None/""/0) should fall back to default "$[*]".
         assert jsonpath_modifier([{"a": 1}], jsonpath="") == {"a": 1}
@@ -12028,6 +12081,78 @@ class TestRemainingCoverageGaps:
             await main_mod.get_a2a_agent.__wrapped__("a1", request, db=MagicMock(), user={"email": "u"})
         assert excinfo.value.status_code == 503
 
+    async def test_get_a2a_agent_card_service_unavailable(self, monkeypatch):
+        # First-Party
+        import mcpgateway.main as main_mod
+
+        request = _make_request("/a2a/a1/card")
+        monkeypatch.setattr(main_mod, "a2a_service", None)
+
+        with pytest.raises(HTTPException) as excinfo:
+            await main_mod.get_a2a_agent_card.__wrapped__("a1", request, FastAPIResponse(), db=MagicMock(), user={"email": "u"})
+        assert excinfo.value.status_code == 503
+
+    async def test_get_a2a_agent_card_resolves_standalone_agent(self, monkeypatch):
+        """A standalone agent's card is returned without consulting the virtual-server fallback (#6700)."""
+        # First-Party
+        import mcpgateway.main as main_mod
+
+        request = _make_request("/a2a/a1/card")
+        monkeypatch.setattr(main_mod, "get_scoped_resource_access_context", lambda _request, _user: ("u", []))
+
+        svc = MagicMock()
+        svc.get_agent_card = AsyncMock(return_value={"name": "ag"})
+        monkeypatch.setattr(main_mod, "a2a_service", svc)
+
+        mock_server_service = MagicMock()
+        monkeypatch.setattr(main_mod, "A2AServerService", lambda: mock_server_service)
+
+        response = FastAPIResponse()
+        result = await main_mod.get_a2a_agent_card.__wrapped__("a1", request, response, db=MagicMock(), user={"email": "u"})
+
+        assert result == {"name": "ag"}
+        mock_server_service.get_server_agent_card.assert_not_called()
+        assert response.headers["cache-control"] == "private, no-store"
+
+    async def test_get_a2a_agent_card_falls_back_to_virtual_server(self, monkeypatch):
+        """No standalone agent matches the ID, so the virtual-server fallback resolves the card (#6700)."""
+        # First-Party
+        import mcpgateway.main as main_mod
+
+        request = _make_request("/a2a/srv-1/card")
+        monkeypatch.setattr(main_mod, "get_scoped_resource_access_context", lambda _request, _user: ("u", []))
+
+        svc = MagicMock()
+        svc.get_agent_card = AsyncMock(return_value=None)
+        monkeypatch.setattr(main_mod, "a2a_service", svc)
+
+        mock_server_service = MagicMock()
+        mock_server_service.get_server_agent_card.return_value = {"name": "srv-as-agent"}
+        monkeypatch.setattr(main_mod, "A2AServerService", lambda: mock_server_service)
+
+        result = await main_mod.get_a2a_agent_card.__wrapped__("srv-1", request, FastAPIResponse(), db=MagicMock(), user={"email": "u"})
+
+        assert result == {"name": "srv-as-agent"}
+
+    async def test_get_a2a_agent_card_not_found_anywhere_raises_404(self, monkeypatch):
+        # First-Party
+        import mcpgateway.main as main_mod
+
+        request = _make_request("/a2a/missing/card")
+        monkeypatch.setattr(main_mod, "get_scoped_resource_access_context", lambda _request, _user: ("u", []))
+
+        svc = MagicMock()
+        svc.get_agent_card = AsyncMock(return_value=None)
+        monkeypatch.setattr(main_mod, "a2a_service", svc)
+
+        mock_server_service = MagicMock()
+        mock_server_service.get_server_agent_card.return_value = None
+        monkeypatch.setattr(main_mod, "A2AServerService", lambda: mock_server_service)
+
+        with pytest.raises(HTTPException) as excinfo:
+            await main_mod.get_a2a_agent_card.__wrapped__("missing", request, FastAPIResponse(), db=MagicMock(), user={"email": "u"})
+        assert excinfo.value.status_code == 404
+
     async def test_create_a2a_agent_public_only_sets_team_id_none(self, monkeypatch):
         # First-Party
         import mcpgateway.main as main_mod
@@ -12102,7 +12227,7 @@ class TestRemainingCoverageGaps:
         )
         monkeypatch.setattr(main_mod.resource_service, "register_resource", AsyncMock(side_effect=ResourceError("bad")))
         with pytest.raises(HTTPException) as excinfo:
-            await main_mod.create_resource.__wrapped__(MagicMock(), request, team_id=None, visibility="public", db=MagicMock(), user={"email": "u"})
+            await main_mod.create_resource.__wrapped__(MagicMock(team_id=None, visibility=None), request, team_id=None, visibility="public", db=MagicMock(), user={"email": "u"})
         assert excinfo.value.status_code == 400
 
     async def test_get_prompt_reraises_unhandled_exception(self, monkeypatch):
