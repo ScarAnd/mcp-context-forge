@@ -31,7 +31,7 @@ def _trusted_internal_runtime_headers() -> dict[str, str]:
     secret = settings.auth_encryption_secret.get_secret_value()
     expected = hashlib.sha256(f"{secret}:contextforge-internal-mcp-runtime-v1".encode("utf-8")).hexdigest()
     return {
-        "x-contextforge-mcp-runtime": "rust",
+        "x-contextforge-mcp-runtime": "affinity",
         "x-contextforge-mcp-runtime-auth": expected,
         "x-contextforge-auth-context": "trusted-payload",
     }
@@ -156,7 +156,7 @@ class TestTokenScopingMiddleware:
 
     @pytest.mark.asyncio
     async def test_trusted_internal_mcp_runtime_request_bypasses_token_scoping(self, middleware, mock_request):
-        """Trusted loopback Rust sidecar hops should bypass token-scoping path checks."""
+        """Trusted loopback Python affinity hops should bypass token-scoping path checks."""
         mock_request.url.path = "/_internal/mcp/rpc"
         mock_request.scope["path"] = "/_internal/mcp/rpc"
         mock_request.method = "POST"
@@ -222,7 +222,7 @@ class TestTokenScopingMiddleware:
         mock_request.method = "POST"
         mock_request.headers = {
             "Authorization": "Bearer scoped-token",
-            "x-contextforge-mcp-runtime": "rust",
+            "x-contextforge-mcp-runtime": "affinity",
             "x-contextforge-mcp-runtime-auth": _trusted_internal_runtime_headers()["x-contextforge-mcp-runtime-auth"],
         }
 
@@ -608,6 +608,8 @@ class TestTokenScopingMiddleware:
             ("GET", "/a2a/agent-1/card", Permissions.A2A_READ),
             ("POST", "/a2a", Permissions.A2A_CREATE),
             ("POST", "/a2a/", Permissions.A2A_CREATE),
+            ("POST", "/a2a/fetch-card", Permissions.A2A_CREATE),
+            ("POST", "/a2a/fetch-card/", Permissions.A2A_CREATE),
             ("PUT", "/a2a/agent-1", Permissions.A2A_UPDATE),
             ("POST", "/a2a/agent-1/state", Permissions.A2A_UPDATE),
             ("POST", "/a2a/agent-1/toggle", Permissions.A2A_UPDATE),
@@ -615,6 +617,10 @@ class TestTokenScopingMiddleware:
             ("POST", "/a2a/invoke", Permissions.A2A_INVOKE),
             ("POST", "/a2a/my-agent/invoke", Permissions.A2A_INVOKE),
             ("POST", "/a2a/my-agent/jsonrpc", Permissions.A2A_INVOKE),
+            ("POST", "/a2a/agent-1/test", Permissions.A2A_INVOKE),
+            ("POST", "/v1/a2a/agent-1/test", Permissions.A2A_INVOKE),
+            ("POST", "/a2a/agent-1/test/", Permissions.A2A_INVOKE),
+            ("GET", "/a2a/metrics", Permissions.A2A_READ),
         ],
     )
     def test_a2a_routes_map_to_declared_permission(self, middleware, method, path, permission):
@@ -627,9 +633,15 @@ class TestTokenScopingMiddleware:
             ("GET", "/a2a", Permissions.A2A_CREATE),
             ("GET", "/a2a/agent-1/card", Permissions.A2A_UPDATE),
             ("POST", "/a2a", Permissions.A2A_READ),
+            ("POST", "/a2a/fetch-card", Permissions.A2A_READ),
+            ("POST", "/a2a/fetch-card", Permissions.A2A_INVOKE),
             ("DELETE", "/a2a/agent-1", Permissions.A2A_UPDATE),
             ("POST", "/a2a/my-agent/invoke", Permissions.A2A_READ),
             ("POST", "/a2a/my-agent/jsonrpc", Permissions.A2A_UPDATE),
+            ("POST", "/a2a/agent-1/test", Permissions.A2A_READ),
+            ("POST", "/a2a/agent-1/test", Permissions.A2A_UPDATE),
+            ("POST", "/v1/a2a/agent-1/test", Permissions.A2A_READ),
+            ("GET", "/a2a/metrics", Permissions.A2A_INVOKE),
         ],
     )
     def test_a2a_routes_reject_wrong_permission(self, middleware, method, path, permission):
@@ -860,6 +872,20 @@ class TestTokenScopingMiddleware:
             assert response.status_code == status.HTTP_429_TOO_MANY_REQUESTS
             assert "Hourly request limit exceeded" in content.get("detail")
             call_next.assert_not_called()
+
+    @pytest.mark.parametrize("permissions", [["tools.read"], ["resources.*"]])
+    @pytest.mark.parametrize("path", ["/auth/email/me", "/v1/auth/email/me"])
+    def test_me_is_readable_with_any_scoped_permissions(self, middleware, path, permissions):
+        """A token scoped to unrelated permissions can still read its own profile and feature flags."""
+        assert middleware._check_permission_restrictions(path, "GET", permissions) is True
+
+    @pytest.mark.parametrize(
+        "method,path",
+        [("POST", "/auth/email/me"), ("PUT", "/auth/email/me"), ("DELETE", "/auth/email/me"), ("GET", "/auth/email/events"), ("GET", "/auth/email/me/extra")],
+    )
+    def test_me_exemption_does_not_widen_other_auth_paths(self, middleware, method, path):
+        """The /me exemption is GET-only and does not cover sibling auth paths."""
+        assert middleware._check_permission_restrictions(path, method, ["tools.read"]) is False
 
     @pytest.mark.asyncio
     async def test_whitelisted_paths_bypass_middleware(self, middleware):
