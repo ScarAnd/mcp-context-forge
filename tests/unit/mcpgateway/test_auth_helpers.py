@@ -387,6 +387,7 @@ def test_session_predates_password_change_respects_setting(monkeypatch):
 def test_get_auth_context_batched_sync_revokes_stale_session(monkeypatch):
     changed = datetime(2026, 1, 1, 12, 0, 5, tzinfo=timezone.utc)
     user = SimpleNamespace(
+        id="11111111-1111-1111-1111-111111111111",
         email="user@example.com",
         password_hash="hash",
         full_name="User",
