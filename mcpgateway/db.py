@@ -24,7 +24,6 @@ Examples:
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import logging
-import os
 import re
 from typing import Any, cast, Dict, Generator, List, Optional, TYPE_CHECKING
 import uuid
@@ -32,9 +31,32 @@ import uuid
 # Third-Party
 import jsonschema
 import sqlalchemy as sa
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, Column, create_engine, DateTime, event, Float, ForeignKey, func, Index
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    Column,
+    create_engine,
+    DateTime,
+    event,
+    Float,
+    ForeignKey,
+    func,
+    Index,
+)
+from sqlalchemy import (
+    Integer,
+    JSON,
+    make_url,
+    MetaData,
+    select,
+    String,
+    Table,
+    Text,
+    text,
+    UniqueConstraint,
+)
 from sqlalchemy import inspect as sa_inspect
-from sqlalchemy import Integer, JSON, make_url, MetaData, select, String, Table, text, Text, UniqueConstraint
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.event import listen
 from sqlalchemy.exc import OperationalError, ProgrammingError, SQLAlchemyError
@@ -119,7 +141,7 @@ elif backend == "sqlite":
 
 # Check for SQLALCHEMY_ECHO environment variable for query debugging
 # This is useful for N+1 detection and performance analysis
-_sqlalchemy_echo = os.getenv("SQLALCHEMY_ECHO", "").lower() in ("true", "1", "yes")
+_sqlalchemy_echo = settings.sqlalchemy_echo
 
 
 def build_engine() -> Engine:
@@ -1364,6 +1386,7 @@ class Permissions:
     # Gateway permissions
     GATEWAYS_CREATE = "gateways.create"
     GATEWAYS_READ = "gateways.read"
+    GATEWAYS_TOKEN_READ = "gateways.token_read"
     GATEWAYS_UPDATE = "gateways.update"
     GATEWAYS_DELETE = "gateways.delete"
 
@@ -3350,6 +3373,9 @@ class Tool(Base):
     # Request type and authentication fields
     auth_type: Mapped[Optional[str]] = mapped_column(String(20), default=None)  # "basic", "bearer", or None
     auth_value: Mapped[Optional[str]] = mapped_column(Text, default=None)
+    sigv4_config: Mapped[Optional[Dict[str, Any]]] = mapped_column(
+        JSON, nullable=True, comment="AWS SigV4 configuration: access_key_id, region, service, unsigned_payload, encrypted secret_access_key and session_token"
+    )
 
     # custom_name,custom_name_slug, display_name
     custom_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=False)
@@ -4471,6 +4497,8 @@ class Server(Base):
     prompts: Mapped[List["Prompt"]] = relationship("Prompt", secondary=server_prompt_association, back_populates="servers")
     a2a_agents: Mapped[List["A2AAgent"]] = relationship("A2AAgent", secondary=server_a2a_association, back_populates="servers")
 
+    interfaces: Mapped[List["ServerInterface"]] = relationship("ServerInterface", cascade="all, delete-orphan", passive_deletes=True, order_by="ServerInterface.created_at")
+
     # API token relationships
     scoped_tokens: Mapped[List["EmailApiToken"]] = relationship("EmailApiToken", back_populates="server")
 
@@ -4688,6 +4716,8 @@ class Server(Base):
     # When enabled, MCP clients can authenticate using OAuth with browser-based IDP SSO
     oauth_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     oauth_config: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    oauth_config_approved: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"), nullable=False)
+    oauth_config_generation: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
 
     # Operator-set instructions text. NULL: not set. Empty string: send no instructions.
     instructions: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -4988,6 +5018,7 @@ class A2AAgent(Base):
     description: Mapped[Optional[str]] = mapped_column(Text)
     endpoint_url: Mapped[str] = mapped_column(String(767), nullable=False)
     agent_type: Mapped[str] = mapped_column(String(50), nullable=False, default="generic")  # e.g., "openai", "anthropic", "custom"
+    protocol_binding: Mapped[Optional[str]] = mapped_column(String(20), nullable=True, default=None)  # "jsonrpc" or "http_json"; NULL uses the URL heuristic
     protocol_version: Mapped[str] = mapped_column(String(10), nullable=False, default="1.0")
     capabilities: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
     skills: Mapped[Optional[List[Dict[str, Any]]]] = mapped_column(JSON, nullable=True, default=None)
@@ -5199,7 +5230,8 @@ class A2AAgentCard(Base):
     """An Agent Card stored as fetched, one row per fetched version.
 
     The card document stays separate from the deployment settings on ``A2AAgent``.
-    The highest ``version`` of an agent is its current card.
+    ``kind`` is ``public`` for the card read without credentials and ``extended`` for the
+    authenticated extended card. The highest ``version`` of a kind is its current card.
     """
 
     __tablename__ = "a2a_agent_cards"
@@ -5207,6 +5239,7 @@ class A2AAgentCard(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: uuid.uuid4().hex)
     a2a_agent_id: Mapped[str] = mapped_column(String(36), ForeignKey("a2a_agents.id", ondelete="CASCADE"), nullable=False, index=True)
     version: Mapped[int] = mapped_column(Integer, nullable=False)
+    kind: Mapped[str] = mapped_column(String(20), nullable=False, default="public", server_default="public")
     card: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False)
     detected_version: Mapped[str] = mapped_column(String(20), nullable=False)
     source_url: Mapped[str] = mapped_column(String(2048), nullable=False)
@@ -5476,6 +5509,7 @@ class OAuthState(Base):
     app_user_email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # Requesting user context for token association
     redirect_uri: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)  # Pinned at authorize time; reused at callback (RFC 6749 §4.1.3)
     team_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # Team ID from JWT for Vault path
+    browser_binding_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     used: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
@@ -5811,6 +5845,7 @@ class SSOProvider(Base):
         userinfo_url (str): User info endpoint
         issuer (str): OIDC issuer (optional)
         jwks_uri (str): OIDC JWKS endpoint for token signature verification (optional)
+        ca_certificate (str): PEM CA bundle trusted for TLS to this provider (optional)
         trusted_domains (List[str]): Auto-approved email domains
         scope (str): OAuth scope string
         auto_create_users (bool): Auto-create users on first login
@@ -5849,6 +5884,7 @@ class SSOProvider(Base):
     userinfo_url: Mapped[str] = mapped_column(String(500), nullable=False)
     issuer: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)  # For OIDC
     jwks_uri: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)  # OIDC JWKS endpoint for token signature verification
+    ca_certificate: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # PEM CA bundle trusted, in addition to system CAs, for TLS to this provider
     trusted_for_api_auth: Mapped[bool] = mapped_column(Boolean, default=False, nullable=True)  # Accept this IdP's access tokens as API/MCP bearer creds (issue #3567)
     api_audience: Mapped[Optional[str]] = mapped_column(
         String(500), nullable=True

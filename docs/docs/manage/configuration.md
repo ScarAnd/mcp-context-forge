@@ -4,6 +4,67 @@ This guide describes configuration options for ContextForge, including database 
 
 ---
 
+## Environment configuration resolution
+
+Application consumers use validated settings, including standalone CLI and readiness commands.
+Process environment variables override values in the working directory's `.env` file.
+Built-in defaults apply when neither source supplies a value.
+Explicit CLI options take precedence over these settings.
+
+The gateway CLI uses `HOST` and `PORT`.
+Legacy `MCG_HOST` and `MCG_PORT` remain supported aliases.
+For each listener setting, resolution follows this order:
+
+1. Explicit CLI option.
+2. Canonical process environment variable (`HOST` or `PORT`).
+3. Legacy process environment variable (`MCG_HOST` or `MCG_PORT`).
+4. Canonical `.env` value.
+5. Legacy `.env` value.
+6. Built-in default (`127.0.0.1` or `4444`).
+
+The CLI now honors `.env` listener values.
+Copying `.env.example` therefore selects its development bind address, `0.0.0.0`, unless overridden.
+Unix socket and file descriptor listeners do not require TCP settings.
+Explicit `--port 0` requests an ephemeral Uvicorn port.
+Only omitted listener options load defaults from settings; invalid unused defaults do not block explicit options.
+Configured `HOST` and `MCG_HOST` values must contain at least one character.
+An empty process or `.env` value causes a validation error when that host default is required.
+Remove the variable to use the loopback default, or configure `0.0.0.0` or `::` explicitly for a wildcard listener.
+
+Gateway and installed database readiness logging default to `ERROR`; Redis readiness logging defaults to `INFO`.
+A configured `LOG_LEVEL` overrides these defaults, with case-insensitive level validation.
+Readiness `--log-level` overrides the configured value.
+The copied SQLAlchemy-only database probe retains its process-environment configuration and `INFO` fallback default.
+
+OAuth timeout/retry settings and metrics custom labels support both process variables and `.env` files.
+CLI bearer tokens and ToolOps credentials use secret-typed settings and remain excluded from support bundle settings.
+ToolOps retains the legacy `OPENAI_MAX_TOEKNS` and `AZURE_OPENAI_MAX_TOEKNS` variable spellings.
+Passthrough headers support JSON arrays and comma-separated names through either source.
+Explicit constructor values take precedence when settings are constructed programmatically.
+
+Deployment launcher variables, SDK-owned environment variables, and secret bootstrap operations retain their existing contracts.
+These rules do not change database-backed SSO provider metadata precedence.
+
+### Upgrade notes
+
+`DEFAULT_PASSTHROUGH_HEADERS` values present only in `.env` now take effect.
+Check file-only allowlists before enabling header passthrough.
+Explicit constructor values override process and file values.
+
+ToolOps reads provider configuration through its own settings model when its provider is constructed.
+Disabled ToolOps does not validate provider configuration during gateway settings initialization.
+Standalone client, builder, reverse-proxy, transport, and SSL-cache sections also retain their own settings models.
+These utility fields are absent from the gateway settings schema and support-bundle settings export.
+
+ToolOps no longer copies arbitrary `.env` values into `os.environ` during import.
+Export SDK-owned variables into the process explicitly, including proxy variables and AWS profile selection.
+Subprocesses inherit exported process values; they do not automatically inherit gateway `.env` values.
+Dynamic SIEM `${ENV_VAR}` substitutions also read exported process values.
+The modeled ToolOps provider credentials and options continue to support `.env` directly.
+
+`SQLALCHEMY_ECHO` preserves its previous string mapping.
+Case-insensitive `true`, `1`, and `yes` enable SQL logging; other strings, including empty values and `on`, disable it.
+
 ## 🔐 Required: Change Before Use
 
 These variables have insecure built-in placeholders. Set each credential before enabling its authentication feature. The gateway rejects empty, placeholder, and known-weak password values at startup.
@@ -451,7 +512,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 | `PASSWORD_RESET_TOKEN_EXPIRY_MINUTES` | Password reset token expiry window     | `60`                  | int > 0 |
 | `PASSWORD_RESET_RATE_LIMIT`   | Max reset requests per email in rate window      | `5`                   | int > 0 |
 | `PASSWORD_RESET_RATE_WINDOW_MINUTES` | Password reset rate-limit window        | `15`                  | int > 0 |
-| `PASSWORD_RESET_INVALIDATE_SESSIONS` | Invalidate active sessions on reset     | `true`                | bool    |
+| `PASSWORD_RESET_INVALIDATE_SESSIONS` | Reject older sessions, revoke API tokens | `true`                | bool    |
 | `PASSWORD_RESET_MIN_RESPONSE_MS` | Minimum forgot-password response duration    | `250`                 | int >= 0 |
 | `PROTECT_ALL_ADMINS`         | Allow active admin accounts to bypass login lockout. Admin self-demotion and last-active-admin protection are always enforced independently. | `true` | bool |
 | `SMTP_ENABLED`                | Enable SMTP notifications for auth emails        | `false`               | bool    |
@@ -501,6 +562,7 @@ These settings control how the gateway authenticates inbound MCP client connecti
 | `MCP_LISTEN_MAX_STREAMS_PER_PRINCIPAL` | Maximum concurrent `subscriptions/listen` streams for one authenticated principal on one worker. The gateway refuses further streams with "Subscription limit reached" | `32` | int (1-1024) |
 | `MCP_LISTEN_MAX_ANONYMOUS_STREAMS` | Maximum concurrent `subscriptions/listen` streams on one worker, shared by all anonymous callers when `MCP_REQUIRE_AUTH` is false. `0` refuses all anonymous streams | `256` | int (0-1024) |
 | `TRUST_PROXY_AUTH`            | Trust proxy authentication headers on inbound requests | `false`               | bool    |
+| `FORWARDED_ALLOW_IPS`         | Comma-separated proxy IPs/CIDRs whose `X-Forwarded-For` and `X-Forwarded-Proto` set the request client address and `request.url` scheme. Requests from other peers use the socket address and scheme. Behind a non-loopback proxy, set this to the proxy address range to keep client IPs (rate limits, token IP restrictions, login and admin audit) and `https` request URLs. `*` trusts every peer and lets clients spoof their IP. Invalid entries stop startup. A CIDR must not have host bits set (`10.0.0.0/24`, not `10.0.0.1/24`). Use `*` alone | `127.0.0.1,::1` | string |
 | `PROXY_USER_HEADER`           | Header containing authenticated username from proxy | `X-Authenticated-User` | string |
 
 !!! warning "MCP Access Control Dependencies"
@@ -590,7 +652,7 @@ For dual-era peers, use `auto` instead of `legacy` only when modern protocol neg
 | `SSO_AUTO_CREATE_USERS`       | Automatically create users from SSO providers    | `true`                | bool    |
 | `SSO_TRUSTED_DOMAINS`         | Trusted email domains (JSON array)               | `[]`                  | JSON array |
 | `SSO_PRESERVE_ADMIN_AUTH`     | Preserve local admin authentication when SSO enabled | `true`            | bool    |
-| `SSO_ALLOW_PROVIDER_LINKING`  | Let a verified email sign in via a different trusted provider (rebinds). Global switch across all providers. Admin status is checked against the new provider on relink. | `false`     | bool    |
+| `SSO_ALLOW_PROVIDER_LINKING`  | Let a verified email sign in via a different trusted provider (rebinds). Global switch across all providers. Admin status is checked against the new provider on relink. Relinking requires an explicit verified-email claim from the new provider. | `false`     | bool    |
 | `SSO_REQUIRE_ADMIN_APPROVAL`  | Require admin approval for new SSO registrations | `false`               | bool    |
 | `SSO_ISSUERS`                 | Optional JSON array of issuer URLs for SSO providers | (none)            | JSON array |
 | `SSO_AUTO_ADMIN_DOMAINS`      | Email domains that automatically get admin privileges | `[]`             | JSON array |
@@ -860,8 +922,8 @@ MCP Gateway can **propagate end-user identity** to upstream MCP servers when pro
 | `IDENTITY_PROPAGATION_MODE`          | How to propagate identity                                | `both`               | `headers`, `meta`, `both`  |
 | `IDENTITY_PROPAGATION_HEADERS_PREFIX`| Prefix for identity HTTP headers                         | `X-Forwarded-User`   | string                     |
 | `IDENTITY_SENSITIVE_ATTRIBUTES`      | User attributes to strip before propagating              | `["password_hash","internal_id","ssn"]` | JSON array |
-| `IDENTITY_SIGN_CLAIMS`               | Sign propagated user claims with HMAC                    | `false`              | bool                       |
-| `IDENTITY_CLAIMS_SECRET`             | Secret key for signing identity claims                   | (none)               | string                     |
+| `IDENTITY_SIGN_CLAIMS`               | Sign propagated user claims as a short-lived JWS         | `false`              | bool                       |
+| `IDENTITY_CLAIMS_SECRET`             | Dedicated secret for signing identity claims (required when signing; not `JWT_SECRET_KEY`) | (none) | string |
 
 **Propagation modes:**
 
@@ -873,7 +935,7 @@ MCP Gateway can **propagate end-user identity** to upstream MCP servers when pro
     Identity propagation can be configured per-gateway by setting the `identity_propagation` JSON field on individual gateway registrations. Per-gateway settings override the global defaults. See the [Identity Propagation guide](identity-propagation.md) for details.
 
 !!! warning "Claim Signing"
-    When `IDENTITY_SIGN_CLAIMS=true`, an HMAC-SHA256 signature is appended to propagated headers/meta so upstream servers can verify the claims were issued by the gateway. Uses `IDENTITY_CLAIMS_SECRET` if set, otherwise falls back to `JWT_SECRET_KEY`.
+    When `IDENTITY_SIGN_CLAIMS=true`, an HS256 JWS over every identity claim, bound to the target gateway id and valid for 60 seconds, is added to propagated headers/meta so upstream servers can verify the claims were issued by the gateway. `IDENTITY_CLAIMS_SECRET` is required and must differ from `JWT_SECRET_KEY`; the gateway refuses to start otherwise. See the [Identity Propagation guide](identity-propagation.md#claim-signing).
 
 ### SSRF Protection
 
@@ -1207,6 +1269,8 @@ Federated (upstream) MCP connections also honor `MCP_CLIENT_CONNECT_MODE`, which
 | `CEL_EXECUTION` | Where tool validation policies (CEL) are evaluated | `subprocess` | `subprocess`, `inprocess` |
 | `CEL_TIMEOUT_SECONDS` | Wall-clock limit for one policy evaluation | `1.0` | 0 < float ≤ 1.0 |
 | `CEL_WORKERS` | Policy sandbox worker processes per gateway process | `2` | int > 0 |
+| `CEL_FILTER_TIMEOUT_SECONDS` | Wall-clock limit for one tool response filter (`jsonpath_filter`) | `2.0` | 0 < float ≤ 60 |
+| `CEL_FILTER_WORKERS` | Response-filter sandbox worker processes per gateway process | `2` | int > 0 |
 
 The forbidden-pattern settings are the global default of the **tool validation policy**. A gateway or a tool can
 override them with its own CEL expression. See [Tool Description Content Validation](../best-practices/input-validation.md#tool-description-content-validation).
@@ -1226,7 +1290,7 @@ override them with its own CEL expression. See [Tool Description Content Validat
 | `UNHEALTHY_THRESHOLD`   | Fail-count before peer deactivation (-1 to disable) | `3`     | int     |
 | `GATEWAY_VALIDATION_TIMEOUT` | Gateway URL validation timeout (secs) | `5`     | int > 0 |
 | `MAX_CONCURRENT_HEALTH_CHECKS` | Max concurrent health checks        | `20`    | int > 0 |
-| `AUTO_REFRESH_SERVERS` | Auto refresh tools/prompts/resources        | `false` | bool    |
+| `AUTO_REFRESH_SERVERS` | Auto refresh tools/prompts/resources. OAuth `authorization_code` servers with no stored user token are skipped and need a manual refresh; the skip is logged once per gateway at `LOG_LEVEL=INFO` | `false` | bool    |
 | `GATEWAY_AUTO_REFRESH_INTERVAL` | Default upstream refresh interval (secs) and catalog `ttlMs` sent to modern clients | `300` | int >= 60 |
 | `GATEWAY_MODERN_LISTENERS_ENABLED` | Hold standing `subscriptions/listen` streams to modern upstream servers for refresh | `false` | bool |
 | `FILELOCK_NAME`         | File lock for leader election             | `gateway_service_leader.lock` | string |
@@ -1274,6 +1338,7 @@ override them with its own CEL expression. See [Tool Description Content Validat
 | `REDIS_RETRY_ON_TIMEOUT`  | Retry on timeout           | `true`     | bool                     |
 | `REDIS_HEALTH_CHECK_INTERVAL` | Health check (secs)    | `30`       | int >= 0                 |
 | `REDIS_DECODE_RESPONSES`  | Return strings vs bytes    | `true`     | bool                     |
+| `REDIS_CLUSTER_MODE`      | Use the `RedisCluster` client (see [Redis Cluster Mode](scale.md#redis-cluster-mode)) | `false` | bool |
 | `REDIS_LEADER_TTL`        | Leader election TTL (secs) | `15`       | int > 0                  |
 | `REDIS_LEADER_KEY`        | Leader key name            | `gateway_service_leader` | string |
 | `REDIS_LEADER_HEARTBEAT_INTERVAL` | Heartbeat (secs)   | `5`        | int > 0                  |

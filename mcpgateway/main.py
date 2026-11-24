@@ -87,6 +87,7 @@ from mcpgateway.auth_context import (
     import_envelope_includes_roots,
     is_trusted_internal_mcp_request,
     is_unrestricted_platform_admin,
+    require_server_oauth_admin,
     selective_selection_includes_roots,
 )
 from mcpgateway.cache import ResourceCache, SessionRegistry
@@ -176,6 +177,7 @@ from mcpgateway.schemas import (
     RPCRequest,
     ServerCreateRequest,
     ServerHandshakeRequest,
+    ServerOAuthApprovalRequest,
     ServerRead,
     ServerUpdate,
     TaggedEntity,
@@ -192,11 +194,11 @@ from mcpgateway.services.a2a_service import A2AAgentError, A2AAgentNameConflictE
 from mcpgateway.services.audit_trail_service import get_audit_trail_service
 from mcpgateway.services.cancellation_service import cancellation_service
 from mcpgateway.services.completion_service import (
+    completion_error_code,
     CompletionError,
     CompletionInvalidParamsError,
     CompletionNotSupportedError,
     CompletionService,
-    completion_error_code,
 )
 from mcpgateway.services.content_security import ContentPatternError, ContentSizeError, ContentTypeError, TemplateValidationError
 from mcpgateway.services.dataplane_publisher.dataplane_publisher import DataplanePublisherService
@@ -232,10 +234,10 @@ from mcpgateway.services.mcp_catalog_service import list_catalog_page
 from mcpgateway.services.mcp_method_registry import mcp_method_registry
 from mcpgateway.services.metrics import setup_metrics
 from mcpgateway.services.modern_listener_service import get_modern_listener_service, init_modern_listener_service
-from mcpgateway.services.resource_subscription_relay import get_resource_subscription_relay
 from mcpgateway.services.permission_service import PermissionService
 from mcpgateway.services.prompt_service import PromptError, PromptLockConflictError, PromptNameConflictError, PromptNotFoundError, PromptUpstreamError, PromptValidationError
 from mcpgateway.services.resource_service import ResourceError, ResourceLockConflictError, ResourceNotFoundError, ResourceURIConflictError, ResourceValidationError
+from mcpgateway.services.resource_subscription_relay import get_resource_subscription_relay
 from mcpgateway.services.server_service import ServerError, ServerLockConflictError, ServerNameConflictError, ServerNotFoundError
 from mcpgateway.services.tag_service import TagService
 from mcpgateway.services.tool_service import ToolError, ToolInvocationError, ToolLockConflictError, ToolNameConflictError, ToolNotFoundError, ToolUnavailableError
@@ -249,12 +251,14 @@ from mcpgateway.transports.streamablehttp_transport import (
 )
 from mcpgateway.utils import uaid as uaid_utils
 from mcpgateway.utils.admin_check import is_admin_bypass_granted
+from mcpgateway.utils.cel_runner import shutdown_cel_pool, start_cel_pool
 from mcpgateway.utils.correlation_id import get_correlation_id
 from mcpgateway.utils.csp_nonce import get_csp_nonce_from_request
+from mcpgateway.utils.env_deprecation import warn_deprecated_envs
 from mcpgateway.utils.error_formatter import (
-    PUBLIC_REASON_CODES,
     ErrorFormatter,
     extract_reason_code,
+    PUBLIC_REASON_CODES,
     PublicValidationError,
     safe_error_detail,
     sanitize_validation_error_for_log,
@@ -262,8 +266,6 @@ from mcpgateway.utils.error_formatter import (
 )
 from mcpgateway.utils.header_filtering import filter_sensitive_headers as _filter_sensitive_headers
 from mcpgateway.utils.internal_http import internal_loopback_base_url, internal_loopback_verify
-from mcpgateway.utils.cel_runner import shutdown_cel_pool, start_cel_pool
-from mcpgateway.utils.jq_runner import shutdown_jq_pool, start_jq_pool
 from mcpgateway.utils.metadata_capture import MetadataCapture
 from mcpgateway.utils.orjson_response import ORJSONResponse
 from mcpgateway.utils.passthrough_headers import set_global_passthrough_headers
@@ -912,6 +914,73 @@ async def _assert_session_owner_or_admin(request: Request, user, session_id: str
     raise HTTPException(status_code=403, detail="Session access denied")
 
 
+async def _resolve_elicitation_target(request: Request, user, params: Dict[str, Any]) -> str:
+    """Pick the session that receives an ``elicitation/create`` request.
+
+    A named session must belong to the requester (admins may name any session).
+    Without a named session, only elicitation-capable sessions owned by the
+    requester are candidates, for admins too.
+
+    Args:
+        request: Incoming request context.
+        user: Authenticated user context.
+        params: JSON-RPC params of the ``elicitation/create`` call.
+
+    Returns:
+        The target session identifier.
+
+    Raises:
+        JSONRPCError: -32602 for a malformed session id, -32002 if the named session
+            does not exist, -32003 if the requester does not own it, -32000 if no
+            owned elicitation-capable session exists.
+    """
+    session_id = params.get("session_id") or params.get("sessionId")
+    if session_id is not None and not isinstance(session_id, str):
+        raise JSONRPCError(-32602, "Invalid elicitation session_id", {"method": "elicitation/create"})
+
+    requester_email, requester_is_admin = get_request_identity(request, user)
+    # get_user_email() falls back to "unknown"; such identities must never match each other's sessions.
+    has_identity = bool(requester_email) and requester_email != "unknown"
+
+    if session_id:
+        if not requester_is_admin and not has_identity:
+            raise JSONRPCError(-32003, _ACCESS_DENIED_MSG, {"method": "elicitation/create"})
+        try:
+            await _assert_session_owner_or_admin(request, user, session_id)
+        except HTTPException as exc:
+            if exc.status_code == status.HTTP_404_NOT_FOUND:
+                raise JSONRPCError(-32002, "Session not found", {"method": "elicitation/create"}) from exc
+            raise JSONRPCError(-32003, str(exc.detail), {"method": "elicitation/create"}) from exc
+        return session_id
+
+    if has_identity:
+        for candidate in await session_registry.get_elicitation_capable_sessions():
+            if await session_registry.get_session_owner(candidate) == requester_email:
+                return candidate
+    raise JSONRPCError(-32000, "No elicitation-capable clients available", {"method": "elicitation/create"})
+
+
+def _bounded_elicitation_timeout(params: Dict[str, Any]) -> float:
+    """Validate the caller-supplied elicitation timeout and cap it at the configured default.
+
+    Args:
+        params: JSON-RPC params of the ``elicitation/create`` call.
+
+    Returns:
+        Timeout in seconds, at most ``settings.mcpgateway_elicitation_timeout``.
+
+    Raises:
+        JSONRPCError: -32602 if the timeout is not a positive finite number.
+    """
+    ceiling = settings.mcpgateway_elicitation_timeout
+    value = params.get("timeout")
+    if value is None:
+        return float(ceiling)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or (isinstance(value, float) and not math.isfinite(value)) or value <= 0:
+        raise JSONRPCError(-32602, "Invalid elicitation timeout", {"method": "elicitation/create"})
+    return float(min(value, ceiling))
+
+
 async def _authorize_run_cancellation(request: Request, user, request_id: str, *, as_jsonrpc_error: bool) -> None:
     """Authorize a notifications/cancelled request for a specific run id.
 
@@ -1296,12 +1365,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # Initialize logging service FIRST to ensure all logging goes to dual output
     await logging_service.initialize()
     logger.info("Starting ContextForge services")
-    if settings.expose_error_details:
-        logger.warning("EXPOSE_ERROR_DETAILS is deprecated and ignored: error responses are always sanitized. Remove it from your configuration.")
+    warn_deprecated_envs()
 
     # Fork the sandbox pools while the process holds no sockets or threads.
     # A pool that fails to start aborts the boot; a missing sandbox is unsafe.
-    start_jq_pool()
     start_validation_pool()
     start_cel_pool()
 
@@ -1451,7 +1518,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             # First-Party
             from mcpgateway.services.leader_election import start_primary_worker_elector  # pylint: disable=import-outside-toplevel
 
-            await start_primary_worker_elector()
+            await start_primary_worker_elector(await get_redis_client())
             logger.info("Primary-worker elector started (backend=redis)")
 
         # Standing subscriptions/listen streams to modern (2026-07-28) servers
@@ -1874,9 +1941,6 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
         # Close Redis client last (after all services that use it)
         await close_redis_client()
-
-        # Shut down the sandboxed jq worker pool
-        shutdown_jq_pool()
 
         # Shut down the sandboxed schema-validation worker pool
         shutdown_validation_pool()
@@ -3257,15 +3321,16 @@ def _register_middleware(app: FastAPI) -> tuple[Optional[Any], bool, list]:  # p
     # but not X-Forwarded-Host (upstream issue encode/uvicorn#965).
     # This ensures request.base_url reflects the proxy's public host, fixing the
     # OAuth redirect_uri hint and other URL construction throughout the admin UI.
-    # Registered alongside ProxyHeadersMiddleware with the same trust model.
+    # It does not apply the FORWARDED_ALLOW_IPS peer check below.
     #
     # Registered BEFORE ProxyHeadersMiddleware so that it is inner (executes after
     # ProxyHeadersMiddleware in the ASGI call chain) and can rely on the scheme
     # already being corrected when deriving the default port for scope["server"].
     app.add_middleware(ForwardedHostMiddleware)
 
-    # Trust all proxies (or lock down with a list of host patterns)
-    app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
+    # Honor X-Forwarded-For/Proto only from peers in FORWARDED_ALLOW_IPS; any other
+    # peer could otherwise spoof the client IP that IP restrictions and rate limits use.
+    app.add_middleware(ProxyHeadersMiddleware, trusted_hosts=settings.forwarded_allow_ips)
 
     # Add correlation ID middleware if enabled
     # Note: Registered AFTER RequestLoggingMiddleware so correlation ID is available when RequestLoggingMiddleware executes
@@ -4151,6 +4216,7 @@ async def create_server(
     """
     try:
         server = payload.server
+        oauth_authorized = await require_server_oauth_admin(request, user, db, server.model_fields_set)
         team_id = payload.team_id
         visibility = payload.visibility
 
@@ -4176,6 +4242,7 @@ async def create_server(
             team_id=team_id,
             owner_email=user_email,
             visibility=visibility,
+            oauth_authorized=oauth_authorized,
         )
         db.commit()
         db.close()
@@ -4219,6 +4286,7 @@ async def update_server(
     """
     try:
         logger.debug(f"User {safe_log_user(user)} is updating server with ID {server_id}")
+        oauth_authorized = await require_server_oauth_admin(request, user, db, server.model_fields_set)
         # Extract modification metadata
         mod_metadata = MetadataCapture.extract_modification_metadata(request, user, 0)  # Version will be incremented in service
 
@@ -4233,6 +4301,7 @@ async def update_server(
             modified_from_ip=mod_metadata["modified_from_ip"],
             modified_via=mod_metadata["modified_via"],
             modified_user_agent=mod_metadata["modified_user_agent"],
+            oauth_authorized=oauth_authorized,
         )
         db.commit()
         db.close()
@@ -4251,6 +4320,41 @@ async def update_server(
     except IntegrityError as e:
         logger.error(f"Integrity error while updating server {server_id}: {e}")
         raise HTTPException(status_code=409, detail=ErrorFormatter.format_database_error(e))
+
+
+@server_router.post("/{server_id}/oauth/approve")
+@require_permission("servers.update")
+async def approve_server_oauth(
+    server_id: str,
+    payload: ServerOAuthApprovalRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> dict[str, Any]:
+    """Approve the virtual-server OAuth settings displayed during administrator review.
+
+    Args:
+        server_id: Reviewed server identifier.
+        payload: Server version displayed during review.
+        request: Authenticated request.
+        db: Active database session.
+        user: Authenticated principal.
+
+    Returns:
+        Approval status and updated server version.
+
+    Raises:
+        HTTPException: If authorization, configuration validation, or version checks fail.
+    """
+    await require_server_oauth_admin(request, user, db, {"oauth_config"})
+    try:
+        return await server_service.approve_oauth_config(db, server_id, payload.version, user_id=get_user_id(user))
+    except ServerNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ServerLockConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ServerError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @server_router.post("/{server_id}/state", response_model=ServerRead)
@@ -4599,8 +4703,9 @@ async def message_endpoint(
 
                     elicitation_service = get_elicitation_service()
                     try:
+                        pending = elicitation_service.get_pending_elicitation(request_id)
                         elicit_result = ElicitResult(**result_data)
-                        if elicitation_service.complete_elicitation(request_id, elicit_result):
+                        if pending is not None and pending.downstream_session_id == session_id and elicitation_service.complete_elicitation(request_id, elicit_result):
                             logger.info(f"Completed elicitation {request_id} from session {session_id}")
                             is_elicitation_response = True
                     except Exception as e:
@@ -4972,6 +5077,44 @@ async def get_a2a_agent_stored_card(
         raise HTTPException(status_code=404, detail=str(e))
     if card is None:
         raise HTTPException(status_code=404, detail="No stored Agent Card for this agent")
+    return card
+
+
+@a2a_router.get("/{agent_id}/stored-card/extended", response_model=A2AStoredCardRead)
+@require_permission("a2a.update")
+async def get_a2a_agent_stored_extended_card(
+    agent_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> A2AStoredCardRead:
+    """Return the authenticated extended Agent Card stored for a registered agent.
+
+    The extended card is content the agent shows only to credentialed callers, so the route
+    needs ``a2a.update`` and agent ownership, not only ``a2a.read`` and visibility.
+
+    Args:
+        agent_id (str): The ID of the agent.
+        request (Request): The FastAPI request object for token scope retrieval.
+        db (Session): The database session used to interact with the data store.
+        user (str): The authenticated user making the request.
+
+    Returns:
+        A2AStoredCardRead: The current stored extended card.
+
+    Raises:
+        HTTPException: If the agent is not visible, the caller does not own it, or it has no stored extended card.
+    """
+    if a2a_service is None:
+        raise HTTPException(status_code=503, detail="A2A service not available")
+    user_email, token_teams = await _require_manageable_a2a_agent(a2a_service, db, request, user, agent_id)
+    try:
+        card = await a2a_service.get_stored_card(db, agent_id, user_email=user_email, token_teams=token_teams, kind="extended")
+    except A2AAgentNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    if card is None:
+        raise HTTPException(status_code=404, detail="No stored extended Agent Card for this agent")
+    _audit_a2a_extended_card_read(request, user, agent_id)
     return card
 
 
@@ -5409,6 +5552,22 @@ def _audit_a2a_task_action(request: Request, user: Any, action: str, agent_id: s
         request_path=request.url.path,
         request_method=request.method,
         details={"agent_id": agent_id, **(details or {})},
+    )
+
+
+def _audit_a2a_extended_card_read(request: Request, user: Any, agent_id: str) -> None:
+    """Record an audit entry for a read of the stored extended Agent Card."""
+    user_email, _ = get_request_identity(request, user)
+    get_audit_trail_service().log_action(
+        action="read_a2a_extended_card",
+        resource_type="a2a_agent",
+        resource_id=agent_id,
+        user_id=user_email or "unknown",
+        user_email=user_email,
+        client_ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        request_path=request.url.path,
+        request_method=request.method,
     )
 
 
@@ -6224,6 +6383,7 @@ async def create_tool(
             return ORJSONResponse(content={"message": str(exc)}, status_code=status.HTTP_403_FORBIDDEN)
 
         logger.debug(f"User {SecurityValidator.sanitize_log_message(user_email)} is creating a new tool for team {team_id}")
+        _, token_teams = get_scoped_resource_access_context(request, user)
         result = await tool_service.register_tool(
             db,
             tool,
@@ -6237,6 +6397,7 @@ async def create_tool(
             owner_email=user_email,
             visibility=visibility,
             user_id=get_user_id(user),
+            token_teams=token_teams,
         )
         db.commit()
         db.close()
@@ -6456,6 +6617,7 @@ async def update_tool(
 
         logger.debug(f"User {safe_log_user(user)} is updating tool with ID {tool_id}")
         user_email = get_user_email(user)
+        _, token_teams = get_scoped_resource_access_context(request, user)
         result = await tool_service.update_tool(
             db,
             tool_id,
@@ -6466,6 +6628,7 @@ async def update_tool(
             modified_user_agent=mod_metadata["modified_user_agent"],
             user_email=user_email,
             user_id=get_user_id(user),
+            token_teams=token_teams,
         )
         db.commit()
         db.close()
@@ -8192,6 +8355,7 @@ async def refresh_gateway_tools(
         user_email = get_user_email(user)
         # Build user_context for Vault token path selection on authorization_code gateways.
         # Uses jwt_teams_claim for session tokens so admin bypass doesn't erase team scope.
+        # First-Party
         from mcpgateway.routers.oauth_router import _build_user_context  # pylint: disable=import-outside-toplevel
 
         user_context = _build_user_context(user)
@@ -8526,6 +8690,12 @@ async def handle_internal_mcp_rpc(request: Request):
     user = _build_internal_mcp_forwarded_user(request)
     db = SessionLocal()
     try:
+        # First-Party
+        from mcpgateway.utils.server_oauth import server_oauth_context_is_current  # pylint: disable=import-outside-toplevel
+
+        auth_context = get_internal_mcp_auth_context(request) or {}
+        if not server_oauth_context_is_current(db, auth_context):
+            raise HTTPException(status_code=401, detail="OAuth configuration requires administrator approval or session reauthentication")
         response = await _handle_rpc_authenticated(request, db=db, user=user)
         if db.is_active and db.in_transaction() is not None:
             db.commit()
@@ -9641,15 +9811,8 @@ async def _handle_rpc_authenticated(request: Request, db: Session, user):
                 logger.warning("Invalid elicitation params: %s", e)
                 raise JSONRPCError(-32602, safe_error_detail(e, "Invalid elicitation params"), params)
 
-            # Get target session (from params or find elicitation-capable session)
-            target_session_id = params.get("session_id") or params.get("sessionId")
-            if not target_session_id:
-                # Find an elicitation-capable session
-                capable_sessions = await session_registry.get_elicitation_capable_sessions()
-                if not capable_sessions:
-                    raise JSONRPCError(-32000, "No elicitation-capable clients available", {"message": elicit_params.message})
-                target_session_id = capable_sessions[0]
-                logger.debug("Selected session %s for elicitation", target_session_id)
+            timeout = _bounded_elicitation_timeout(params)
+            target_session_id = await _resolve_elicitation_target(request, user, params)
 
             # Verify session has elicitation capability
             if not await session_registry.has_elicitation_capability(target_session_id):
@@ -9657,9 +9820,6 @@ async def _handle_rpc_authenticated(request: Request, db: Session, user):
 
             # Get elicitation service and create request
             elicitation_service = get_elicitation_service()
-
-            # Extract timeout from params or use default
-            timeout = params.get("timeout", settings.mcpgateway_elicitation_timeout)
 
             try:
                 # Create elicitation request - this stores it and waits for response
